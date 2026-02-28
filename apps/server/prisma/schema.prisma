@@ -1,0 +1,23 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model NamuwikiDocument {
+  id           BigInt                     @id @default(autoincrement())
+  docHash      String                     @unique @map("doc_hash")
+  title        String?
+  content      String
+  contributors String?
+  namespace    String?
+  searchVector Unsupported("tsvector")?  @map("search_vector")
+  embedding    Unsupported("vector(384)")?
+  createdAt    DateTime                   @default(now()) @map("created_at")
+  updatedAt    DateTime                   @updatedAt @map("updated_at")
+
+  @@map("namuwiki_documents")
+}
