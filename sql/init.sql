@@ -28,3 +28,9 @@ ALTER TABLE namuwiki_documents
 
 CREATE INDEX IF NOT EXISTS idx_namuwiki_documents_search_vector
     ON namuwiki_documents USING GIN (search_vector);
+
+CREATE INDEX IF NOT EXISTS idx_namuwiki_documents_embedding_hnsw_cosine
+    ON namuwiki_documents USING hnsw (embedding vector_cosine_ops);
+
+CREATE INDEX IF NOT EXISTS idx_namuwiki_documents_embedding_ivfflat_ip
+    ON namuwiki_documents USING ivfflat (embedding vector_ip_ops) WITH (lists = 200);

@@ -9,38 +9,29 @@ import {
   SearchHybridOptions,
   SearchQueryOptions
 } from './app.service'
-
-interface SearchRequest {
-  query: string
-  offset?: number
-  limit?: number
-}
-
-interface SearchHybridRequest extends SearchRequest {
-  mode?: 'none' | 'hnsw' | 'ivf'
-  bm25Enabled?: boolean
-  hybridRatio?: number
-}
-
-interface ApiMeta {
-  total: number
-  offset: number
-  limit: number
-  tookMs?: number
-  requestId?: string
-}
-
-interface ApiResponse<T> {
-  success: boolean
-  data: T[]
-  error?: string
-  meta?: ApiMeta
-}
+import {
+  ApiResponse,
+  SearchHybridRequest,
+  SearchMode,
+  SearchRequest
+} from './types/search-contract'
 
 interface HealthData {
   status: string
   service: string
   database: string
+}
+
+interface ParsedSearchRequest {
+  query: string
+  offset: number
+  limit: number
+}
+
+interface ParsedSearchHybridRequest extends ParsedSearchRequest {
+  mode: SearchMode
+  bm25Enabled: boolean
+  hybridRatio: number
 }
 
 interface SearchResultData {
@@ -97,6 +88,7 @@ export class AppController {
         limit: request.limit
       }
       const results = await this.appService.search(request.query, options)
+      const tookMs = Date.now() - startedAt
 
       return {
         success: true,
@@ -110,7 +102,7 @@ export class AppController {
           total: results.total,
           offset: options.offset,
           limit: options.limit,
-          tookMs: Date.now() - startedAt
+          tookMs
         }
       }
     } catch {
@@ -155,6 +147,7 @@ export class AppController {
       }
 
       const results = await this.appService.searchHybrid(request.query, options)
+      const tookMs = Date.now() - startedAt
 
       return {
         success: true,
@@ -168,7 +161,7 @@ export class AppController {
           total: results.total,
           offset: options.offset,
           limit: options.limit,
-          tookMs: Date.now() - startedAt
+          tookMs
         }
       }
     } catch {
@@ -188,8 +181,10 @@ export class AppController {
 
   private parseSearchRequest(
     body: unknown
-  ): { value: Required<SearchRequest>; error?: string } {
-    if (!this.hasQuery(body) || typeof body.query !== 'string') {
+  ): { value: ParsedSearchRequest; error?: string } {
+    const rawRequest = this.toSearchRequestCandidate(body)
+
+    if (!rawRequest || typeof rawRequest.query !== 'string') {
       return {
         value: {
           query: '',
@@ -200,7 +195,7 @@ export class AppController {
       }
     }
 
-    const normalizedQuery = body.query.trim()
+    const normalizedQuery = rawRequest.query.trim()
 
     if (!normalizedQuery) {
       return {
@@ -224,8 +219,8 @@ export class AppController {
       }
     }
 
-    const offset = this.toIntOrDefault(this.pickOptionalNumber(body, 'offset'), 0)
-    const limit = this.toIntOrDefault(this.pickOptionalNumber(body, 'limit'), 20)
+    const offset = this.toIntOrDefault(rawRequest.offset, 0)
+    const limit = this.toIntOrDefault(rawRequest.limit, 20)
 
     if (offset < 0) {
       return {
@@ -261,7 +256,7 @@ export class AppController {
   private parseSearchHybridRequest(
     body: unknown
   ): {
-    value: Required<SearchHybridRequest>
+    value: ParsedSearchHybridRequest
     error?: string
   } {
     const parsedSearch = this.parseSearchRequest(body)
@@ -280,15 +275,15 @@ export class AppController {
       }
     }
 
-    const mode = this.pickOptionalString(body, 'mode') ?? 'none'
-    const bm25Enabled =
-      this.pickOptionalBoolean(body, 'bm25Enabled') ?? true
+    const rawRequest = this.toSearchHybridRequestCandidate(body)
+    const mode = rawRequest?.mode ?? 'none'
+    const bm25Enabled = rawRequest?.bm25Enabled ?? true
     const hybridRatio = this.toIntOrDefault(
-      this.pickOptionalNumber(body, 'hybridRatio'),
+      rawRequest?.hybridRatio,
       50
     )
 
-    if (!['none', 'hnsw', 'ivf'].includes(mode)) {
+    if (!this.isSearchMode(mode)) {
       return {
         value: {
           ...parsedSearch.value,
@@ -304,7 +299,7 @@ export class AppController {
       return {
         value: {
           ...parsedSearch.value,
-          mode: mode as 'none' | 'hnsw' | 'ivf',
+          mode,
           bm25Enabled,
           hybridRatio: 50
         },
@@ -315,22 +310,57 @@ export class AppController {
     return {
       value: {
         ...parsedSearch.value,
-        mode: mode as 'none' | 'hnsw' | 'ivf',
+        mode,
         bm25Enabled,
         hybridRatio
       }
     }
   }
 
+  private toSearchRequestCandidate(value: unknown): Partial<SearchRequest> | null {
+    if (typeof value !== 'object' || value === null) {
+      return null
+    }
+
+    const raw = value as Record<string, unknown>
+
+    return {
+      query: typeof raw.query === 'string' ? raw.query : undefined,
+      offset: this.pickOptionalNumber(raw, 'offset'),
+      limit: this.pickOptionalNumber(raw, 'limit')
+    }
+  }
+
+  private toSearchHybridRequestCandidate(
+    value: unknown
+  ): Partial<SearchHybridRequest> | null {
+    if (typeof value !== 'object' || value === null) {
+      return null
+    }
+
+    const raw = value as Record<string, unknown>
+
+    return {
+      ...this.toSearchRequestCandidate(value),
+      mode: this.pickOptionalString(raw, 'mode') as SearchMode | undefined,
+      bm25Enabled: this.pickOptionalBoolean(raw, 'bm25Enabled'),
+      hybridRatio: this.pickOptionalNumber(raw, 'hybridRatio')
+    }
+  }
+
+  private isSearchMode(mode: string): mode is SearchMode {
+    return mode === 'none' || mode === 'hnsw' || mode === 'ivf'
+  }
+
   private pickOptionalNumber(
-    value: unknown,
+    value: Record<string, unknown>,
     key: string
   ): number | undefined {
-    if (typeof value !== 'object' || value === null || !(key in value)) {
+    if (!(key in value)) {
       return undefined
     }
 
-    const raw = (value as Record<string, unknown>)[key]
+    const raw = value[key]
 
     if (typeof raw === 'number') {
       return raw
@@ -345,26 +375,26 @@ export class AppController {
   }
 
   private pickOptionalString(
-    value: unknown,
+    value: Record<string, unknown>,
     key: string
   ): string | undefined {
-    if (typeof value !== 'object' || value === null || !(key in value)) {
+    if (!(key in value)) {
       return undefined
     }
 
-    const raw = (value as Record<string, unknown>)[key]
+    const raw = value[key]
     return typeof raw === 'string' ? raw : undefined
   }
 
   private pickOptionalBoolean(
-    value: unknown,
+    value: Record<string, unknown>,
     key: string
   ): boolean | undefined {
-    if (typeof value !== 'object' || value === null || !(key in value)) {
+    if (!(key in value)) {
       return undefined
     }
 
-    const raw = (value as Record<string, unknown>)[key]
+    const raw = value[key]
     return typeof raw === 'boolean' ? raw : undefined
   }
 
@@ -378,9 +408,5 @@ export class AppController {
     }
 
     return Math.trunc(value)
-  }
-
-  private hasQuery(value: unknown): value is { query: unknown } {
-    return typeof value === 'object' && value !== null && 'query' in value
   }
 }

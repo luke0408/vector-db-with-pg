@@ -34,6 +34,16 @@ export interface SearchHybridOptions extends SearchQueryOptions {
   hybridRatio: number
 }
 
+interface HybridSearchRow {
+  id: bigint
+  title: string | null
+  snippet: string
+  namespace: string | null
+  contributors: string | null
+  vector_distance: number
+  bm25_score: number
+}
+
 interface SearchExecutionResult {
   items: SearchResult[]
   total: number
@@ -43,37 +53,6 @@ interface SearchExecutionResult {
 @Injectable()
 export class AppService {
   constructor(private readonly prismaService: PrismaService) {}
-
-  private readonly dummySearchResults: ReadonlyArray<SearchResult> = [
-    {
-      id: 1,
-      title: 'ARM (Architecture)',
-      snippet:
-        'ARM architecture is a family of reduced instruction set computer architectures for processors across mobile and server platforms.',
-      score: 0.984
-    },
-    {
-      id: 2,
-      title: 'Bose Corporation',
-      snippet:
-        'Bose Corporation is an American manufacturing company known for home audio systems and active noise-cancelling headphones.',
-      score: 0.891
-    },
-    {
-      id: 3,
-      title: 'SSD (Solid State Drive)',
-      snippet:
-        'A solid-state drive uses integrated circuits and flash memory to provide fast persistent storage in modern computing systems.',
-      score: 0.847
-    },
-    {
-      id: 4,
-      title: 'AMOLED Display',
-      snippet:
-        'AMOLED is a display technology that combines organic light-emitting diodes with active-matrix pixel addressing.',
-      score: 0.723
-    }
-  ]
 
   async health() {
     let database = 'up'
@@ -205,7 +184,7 @@ export class AppService {
         }
       }
     } catch {
-      return this.buildFallbackResult(normalizedQuery, options)
+      return this.buildUnavailableResult()
     }
   }
 
@@ -233,7 +212,8 @@ export class AppService {
       ? Number((1 - semanticWeight).toFixed(3))
       : 0
 
-    const hybridSql = `
+    if (options.mode === 'none') {
+      const hybridSql = `
       SELECT
         id,
         title,
@@ -264,21 +244,196 @@ export class AppService {
       LIMIT $9 OFFSET $10
     `
 
-    const countSql = `
+      const countSql = `
       SELECT COUNT(*)::bigint AS total
       FROM namuwiki_documents
       WHERE LOWER(COALESCE(title, '')) LIKE $1
          OR LOWER(content) LIKE $2
     `
 
-    const explainSql = `EXPLAIN (FORMAT JSON) ${hybridSql}`
+      const explainSql = `EXPLAIN (FORMAT JSON) ${hybridSql}`
+
+      try {
+        const [rawRows, countRows, planRows] = await Promise.all([
+          this.prismaService.$queryRawUnsafe(
+            hybridSql,
+            queryPattern,
+            queryPattern,
+            options.bm25Enabled,
+            normalizedQuery,
+            queryPattern,
+            queryPattern,
+            semanticWeight,
+            keywordWeight,
+            options.limit,
+            options.offset
+          ),
+          this.prismaService.$queryRawUnsafe(countSql, queryPattern, queryPattern),
+          this.prismaService.$queryRawUnsafe(
+            explainSql,
+            queryPattern,
+            queryPattern,
+            options.bm25Enabled,
+            normalizedQuery,
+            queryPattern,
+            queryPattern,
+            semanticWeight,
+            keywordWeight,
+            options.limit,
+            options.offset
+          )
+        ])
+
+        const rows = rawRows as Array<{
+          id: bigint
+          title: string | null
+          snippet: string
+          namespace: string | null
+          contributors: string | null
+          vector_score: number
+          bm25_score: number
+        }>
+
+        const total = Number(
+          ((countRows as Array<{ total: bigint }>)[0]?.total ?? BigInt(0)).toString()
+        )
+
+        const executionPlan = this.parseExecutionPlan(
+          planRows as Array<Record<string, unknown>>
+        )
+
+        return {
+          items: rows.map((row) => {
+            const score = Number(
+              (row.vector_score * semanticWeight + row.bm25_score * keywordWeight).toFixed(3)
+            )
+
+            return {
+              id: Number(row.id),
+              title: row.title ?? 'Untitled Document',
+              snippet: row.snippet,
+              score,
+              category: row.namespace ?? 'Unknown',
+              distance: Number((1 - score).toFixed(4)),
+              tags: this.toTags(row.contributors),
+              matchRate: Number((score * 100).toFixed(1))
+            }
+          }),
+          total,
+          learning: {
+            generatedSql: `${hybridSql.trim()}\n-- mode: ${options.mode}, bm25: ${options.bm25Enabled}, hybridRatio: ${options.hybridRatio}`,
+            executionPlan,
+            queryExplanation: this.buildQueryExplanation(executionPlan)
+          }
+        }
+      } catch {
+        return this.buildUnavailableResult()
+      }
+    }
+
+    const queryVectorSql = `
+      SELECT embedding::text AS query_vector
+      FROM namuwiki_documents
+      WHERE search_vector @@ plainto_tsquery('simple', $1)
+        AND embedding IS NOT NULL
+      ORDER BY ts_rank_cd(search_vector, plainto_tsquery('simple', $1)) DESC,
+               id DESC
+      LIMIT 1
+    `
+
+    const distanceOperator = options.mode === 'ivf' ? '<#>' : '<=>'
+    const candidatePool = Math.max(options.limit + options.offset, 20) * 25
+
+    const annSql = `
+      WITH ann_candidates AS (
+        SELECT
+          id,
+          embedding ${distanceOperator} $1::vector AS vector_distance
+        FROM namuwiki_documents
+        WHERE embedding IS NOT NULL
+        ORDER BY embedding ${distanceOperator} $1::vector
+        LIMIT $2
+      ),
+      rescored AS (
+        SELECT
+          d.id,
+          d.title,
+          LEFT(d.content, 240) AS snippet,
+          d.namespace,
+          d.contributors,
+          ann_candidates.vector_distance,
+          CASE
+            WHEN $3::boolean = true THEN ts_rank_cd(COALESCE(d.search_vector, ''::tsvector), plainto_tsquery('simple', $4))
+            ELSE 0
+          END AS bm25_score
+        FROM ann_candidates
+        JOIN namuwiki_documents d ON d.id = ann_candidates.id
+        WHERE LOWER(COALESCE(d.title, '')) LIKE $5
+           OR LOWER(d.content) LIKE $6
+      )
+      SELECT
+        id,
+        title,
+        snippet,
+        namespace,
+        contributors,
+        vector_distance,
+        bm25_score
+      FROM rescored
+      ORDER BY (($7 * (1 - vector_distance)) + ($8 * bm25_score)) DESC,
+               id DESC
+      LIMIT $9 OFFSET $10
+    `
+
+    const annCountSql = `
+      WITH ann_candidates AS (
+        SELECT id
+        FROM namuwiki_documents
+        WHERE embedding IS NOT NULL
+        ORDER BY embedding ${distanceOperator} $1::vector
+        LIMIT $2
+      )
+      SELECT COUNT(*)::bigint AS total
+      FROM ann_candidates
+      JOIN namuwiki_documents d ON d.id = ann_candidates.id
+      WHERE LOWER(COALESCE(d.title, '')) LIKE $3
+         OR LOWER(d.content) LIKE $4
+    `
+
+    const explainSql = `EXPLAIN (FORMAT JSON) ${annSql}`
 
     try {
+      const queryVectorRows = (await this.prismaService.$queryRawUnsafe(
+        queryVectorSql,
+        normalizedQuery
+      )) as Array<{ query_vector: string | null }>
+
+      const queryVector = queryVectorRows[0]?.query_vector
+
+      if (!queryVector) {
+        return {
+          items: [],
+          total: 0,
+          learning: {
+            generatedSql:
+              `${queryVectorSql.trim()}\n-- no seed embedding found for query, ANN skipped\n-- mode: ${options.mode}, bm25: ${options.bm25Enabled}, hybridRatio: ${options.hybridRatio}`,
+            executionPlan: {
+              Plan: {
+                'Node Type': 'Unavailable',
+                Reason: 'No seed embedding found for ANN query'
+              }
+            },
+            queryExplanation:
+              'ANN mode requires at least one seed embedding from lexical full-text matching, but none was found.'
+          }
+        }
+      }
+
       const [rawRows, countRows, planRows] = await Promise.all([
         this.prismaService.$queryRawUnsafe(
-          hybridSql,
-          queryPattern,
-          queryPattern,
+          annSql,
+          queryVector,
+          candidatePool,
           options.bm25Enabled,
           normalizedQuery,
           queryPattern,
@@ -288,11 +443,17 @@ export class AppService {
           options.limit,
           options.offset
         ),
-        this.prismaService.$queryRawUnsafe(countSql, queryPattern, queryPattern),
+        this.prismaService.$queryRawUnsafe(
+          annCountSql,
+          queryVector,
+          candidatePool,
+          queryPattern,
+          queryPattern
+        ),
         this.prismaService.$queryRawUnsafe(
           explainSql,
-          queryPattern,
-          queryPattern,
+          queryVector,
+          candidatePool,
           options.bm25Enabled,
           normalizedQuery,
           queryPattern,
@@ -304,15 +465,7 @@ export class AppService {
         )
       ])
 
-      const rows = rawRows as Array<{
-        id: bigint
-        title: string | null
-        snippet: string
-        namespace: string | null
-        contributors: string | null
-        vector_score: number
-        bm25_score: number
-      }>
+      const rows = rawRows as HybridSearchRow[]
 
       const total = Number(
         ((countRows as Array<{ total: bigint }>)[0]?.total ?? BigInt(0)).toString()
@@ -324,8 +477,9 @@ export class AppService {
 
       return {
         items: rows.map((row) => {
+          const vectorScore = Number((1 - row.vector_distance).toFixed(3))
           const score = Number(
-            (row.vector_score * semanticWeight + row.bm25_score * keywordWeight).toFixed(3)
+            (vectorScore * semanticWeight + row.bm25_score * keywordWeight).toFixed(3)
           )
 
           return {
@@ -334,44 +488,37 @@ export class AppService {
             snippet: row.snippet,
             score,
             category: row.namespace ?? 'Unknown',
-            distance: Number((1 - score).toFixed(4)),
+            distance: Number(row.vector_distance.toFixed(4)),
             tags: this.toTags(row.contributors),
             matchRate: Number((score * 100).toFixed(1))
           }
         }),
         total,
         learning: {
-          generatedSql: `${hybridSql.trim()}\n-- mode: ${options.mode}, bm25: ${options.bm25Enabled}, hybridRatio: ${options.hybridRatio}`,
+          generatedSql: `${queryVectorSql.trim()}\n${annSql.trim()}\n-- mode: ${options.mode}, bm25: ${options.bm25Enabled}, hybridRatio: ${options.hybridRatio}, candidatePool: ${candidatePool}`,
           executionPlan,
           queryExplanation: this.buildQueryExplanation(executionPlan)
         }
       }
     } catch {
-      return this.buildFallbackResult(normalizedQuery, options)
+      return this.buildUnavailableResult()
     }
   }
 
-  private buildFallbackResult(
-    normalizedQuery: string,
-    options: SearchQueryOptions
-  ): SearchExecutionResult {
-    const filtered = this.filterDummyResults(normalizedQuery)
-    const paged = filtered.slice(options.offset, options.offset + options.limit)
-
+  private buildUnavailableResult(): SearchExecutionResult {
     return {
-      items: paged,
-      total: filtered.length,
+      items: [],
+      total: 0,
       learning: {
-        generatedSql:
-          '-- fallback mode: database query unavailable, returning in-memory dummy rows',
+        generatedSql: '-- database unavailable: query execution skipped',
         executionPlan: {
           Plan: {
-            'Node Type': 'FallbackInMemory',
-            'Plan Rows': paged.length
+            'Node Type': 'Unavailable',
+            Reason: 'Database query failed'
           }
         },
         queryExplanation:
-          'Database connection unavailable. Returned fallback in-memory sample results.'
+          'Database query failed, so no search results were returned. Check database connectivity and retry.'
       }
     }
   }
@@ -440,41 +587,4 @@ export class AppService {
     return tokens.length > 0 ? tokens : ['NamuWiki']
   }
 
-  private filterDummyResults(normalizedQuery: string): SearchResult[] {
-    const exactMatches = this.dummySearchResults.filter((result) =>
-      result.title.toLowerCase().includes(normalizedQuery)
-    )
-
-    if (exactMatches.length > 0) {
-      return exactMatches.map((result) => ({
-        ...result,
-        category: 'Fallback',
-        distance: Number((1 - result.score).toFixed(4)),
-        tags: ['Fallback'],
-        matchRate: Number((result.score * 100).toFixed(1))
-      }))
-    }
-
-    const snippetMatches = this.dummySearchResults.filter((result) =>
-      result.snippet.toLowerCase().includes(normalizedQuery)
-    )
-
-    if (snippetMatches.length > 0) {
-      return snippetMatches.map((result) => ({
-        ...result,
-        category: 'Fallback',
-        distance: Number((1 - result.score).toFixed(4)),
-        tags: ['Fallback'],
-        matchRate: Number((result.score * 100).toFixed(1))
-      }))
-    }
-
-    return this.dummySearchResults.map((result) => ({
-      ...result,
-      category: 'Fallback',
-      distance: Number((1 - result.score).toFixed(4)),
-      tags: ['Fallback'],
-      matchRate: Number((result.score * 100).toFixed(1))
-    }))
-  }
 }

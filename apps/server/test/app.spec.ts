@@ -1,10 +1,23 @@
-import { Test } from '@nestjs/testing'
+import { Test, TestingModule } from '@nestjs/testing'
 import { AppController } from '../src/app.controller'
 import { AppService } from '../src/app.service'
 import { PrismaService } from '../src/prisma/prisma.service'
 
 const prismaServiceMock = {
   $queryRawUnsafe: jest.fn()
+}
+
+async function createTestingModule(): Promise<TestingModule> {
+  return Test.createTestingModule({
+    controllers: [AppController],
+    providers: [
+      AppService,
+      {
+        provide: PrismaService,
+        useValue: prismaServiceMock
+      }
+    ]
+  }).compile()
 }
 
 describe('AppController', () => {
@@ -15,17 +28,7 @@ describe('AppController', () => {
   it('returns api health payload with db status', async () => {
     prismaServiceMock.$queryRawUnsafe.mockResolvedValueOnce([{ '?column?': 1 }])
 
-    const moduleRef = await Test.createTestingModule({
-      controllers: [AppController],
-      providers: [
-        AppService,
-        {
-          provide: PrismaService,
-          useValue: prismaServiceMock
-        }
-      ]
-    }).compile()
-
+    const moduleRef = await createTestingModule()
     const controller = moduleRef.get(AppController)
     const response = await controller.health()
 
@@ -67,17 +70,7 @@ describe('AppController', () => {
         }
       ])
 
-    const moduleRef = await Test.createTestingModule({
-      controllers: [AppController],
-      providers: [
-        AppService,
-        {
-          provide: PrismaService,
-          useValue: prismaServiceMock
-        }
-      ]
-    }).compile()
-
+    const moduleRef = await createTestingModule()
     const controller = moduleRef.get(AppController)
     const response = await controller.search({ query: 'ARM', offset: 0, limit: 10 })
 
@@ -96,17 +89,7 @@ describe('AppController', () => {
   })
 
   it('returns validation error envelope for empty query', async () => {
-    const moduleRef = await Test.createTestingModule({
-      controllers: [AppController],
-      providers: [
-        AppService,
-        {
-          provide: PrismaService,
-          useValue: prismaServiceMock
-        }
-      ]
-    }).compile()
-
+    const moduleRef = await createTestingModule()
     const controller = moduleRef.get(AppController)
     const response = await controller.search({ query: '   ' })
 
@@ -119,12 +102,17 @@ describe('AppController', () => {
     prismaServiceMock.$queryRawUnsafe
       .mockResolvedValueOnce([
         {
+          query_vector: '[0.1,0.2,0.3]'
+        }
+      ])
+      .mockResolvedValueOnce([
+        {
           id: BigInt(1),
           title: 'ARM (Architecture)',
           snippet: 'ARM architecture ...',
           namespace: 'Computing',
           contributors: 'user-a,user-b',
-          vector_score: 0.95,
+          vector_distance: 0.05,
           bm25_score: 0.55
         }
       ])
@@ -144,17 +132,7 @@ describe('AppController', () => {
         }
       ])
 
-    const moduleRef = await Test.createTestingModule({
-      controllers: [AppController],
-      providers: [
-        AppService,
-        {
-          provide: PrismaService,
-          useValue: prismaServiceMock
-        }
-      ]
-    }).compile()
-
+    const moduleRef = await createTestingModule()
     const controller = moduleRef.get(AppController)
     const response = await controller.searchHybrid({
       query: 'ARM',

@@ -1,61 +1,22 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useState, type KeyboardEvent } from 'react'
 import {
   SearchLearningData,
   SearchMeta,
   SearchResult,
   searchDocuments
 } from './lib/search-api'
+import { formatSnippet } from './lib/snippet-format'
 
 type SearchMode = 'none' | 'hnsw' | 'ivf'
 
-const initialResults: SearchResult[] = [
-  {
-    id: 1,
-    title: 'ARM (Architecture)',
-    category: 'Computing > Hardware > ISA',
-    matchRate: 98.4,
-    distance: 0.0124,
-    snippet:
-      'ARM architecture is a family of reduced instruction set computer architectures for processors across mobile and server platforms.',
-    tags: ['RISC', 'Semiconductor', 'Mobile Computing'],
-    score: 0.984
-  },
-  {
-    id: 2,
-    title: 'Bose Corporation',
-    category: 'Technology > Audio',
-    matchRate: 89.1,
-    distance: 0.1089,
-    snippet:
-      'Bose Corporation is an American manufacturing company known for home audio systems and active noise-cancelling headphones.',
-    tags: ['Audio', 'Consumer Tech'],
-    score: 0.891
-  }
-]
-
-const initialLearning: SearchLearningData = {
-  generatedSql: `SELECT title, content,
-  vector_distance(embedding, $1) AS dist
-FROM namuwiki_articles
-WHERE content @@ to_tsquery('english', 'search_term')
-ORDER BY dist ASC
-LIMIT 5;`,
-  executionPlan: {
-    Plan: {
-      'Node Type': 'Index Scan',
-      'Index Name': 'wiki_idx_hnsw',
-      'Startup Cost': 0,
-      'Total Cost': 12.45,
-      'Plan Rows': 5,
-      Filter: '(similarity > 0.85)'
-    }
-  },
-  queryExplanation:
-    'Planner selected Index Scan using HNSW index for fast nearest-neighbor retrieval.'
+const emptyLearning: SearchLearningData = {
+  generatedSql: '-- run search to generate SQL',
+  executionPlan: {},
+  queryExplanation: 'Run a search to view query explanation.'
 }
 
 export function App() {
-  const [query, setQuery] = useState('ARM')
+  const [query, setQuery] = useState('')
   const [searchMode, setSearchMode] = useState<SearchMode>('none')
   const [bm25Enabled, setBm25Enabled] = useState(true)
   const [hybridRatio, setHybridRatio] = useState(50)
@@ -64,8 +25,8 @@ export function App() {
   const [showExplanation, setShowExplanation] = useState(true)
   const [offset, setOffset] = useState(0)
   const [limit] = useState(10)
-  const [results, setResults] = useState<SearchResult[]>(initialResults)
-  const [learning, setLearning] = useState<SearchLearningData>(initialLearning)
+  const [results, setResults] = useState<SearchResult[]>([])
+  const [learning, setLearning] = useState<SearchLearningData>(emptyLearning)
   const [meta, setMeta] = useState<SearchMeta | undefined>()
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(false)
@@ -114,7 +75,7 @@ export function App() {
 
     if (!payload) {
       setResults([])
-      setLearning(initialLearning)
+      setLearning(emptyLearning)
       setMeta(response.meta)
       setOffset(nextOffset)
       setIsLoading(false)
@@ -126,6 +87,14 @@ export function App() {
     setMeta(response.meta)
     setOffset(nextOffset)
     setIsLoading(false)
+  }
+
+  const handleQueryKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.key !== 'Enter' || event.nativeEvent.isComposing || isLoading) {
+      return
+    }
+
+    void handleSearch(0)
   }
 
   const executionPlanText = useMemo(
@@ -155,6 +124,7 @@ export function App() {
                 placeholder="Search across NamuWiki articles..."
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
+                onKeyDown={handleQueryKeyDown}
               />
             </div>
             <button
@@ -321,7 +291,7 @@ export function App() {
                       </small>
                     </div>
                   </div>
-                  <p className="result-snippet">{result.snippet}</p>
+                  <p className="result-snippet">{formatSnippet(result.snippet)}</p>
                   <div className="result-tags">
                     {(result.tags ?? ['NamuWiki']).map((tag) => (
                       <span key={`${result.id}-${tag}`}>{tag}</span>
