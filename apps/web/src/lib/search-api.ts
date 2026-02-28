@@ -3,21 +3,66 @@ export interface SearchResult {
   title: string
   snippet: string
   score: number
+  category?: string
+  distance?: number
+  tags?: string[]
+  matchRate?: number
+}
+
+export interface SearchLearningData {
+  generatedSql: string
+  executionPlan: Record<string, unknown>
+  queryExplanation: string
+}
+
+export interface SearchResponseData {
+  items: SearchResult[]
+  learning: SearchLearningData
+}
+
+export interface SearchMeta {
+  total: number
+  offset: number
+  limit: number
+  tookMs?: number
+  requestId?: string
 }
 
 export interface SearchResponse {
   success: boolean
-  data?: SearchResult[]
+  data: SearchResponseData[]
   error?: string
+  meta?: SearchMeta
+}
+
+export interface SearchRequestOptions {
+  offset?: number
+  limit?: number
+  useHybrid?: boolean
+  mode?: 'none' | 'hnsw' | 'ivf'
+  bm25Enabled?: boolean
+  hybridRatio?: number
 }
 
 const SERVER_BASE_URL = import.meta.env.VITE_SERVER_URL ?? 'http://localhost:3000'
 
-export async function searchDocuments(query: string): Promise<SearchResponse> {
-  const payload = { query }
+export async function searchDocuments(
+  query: string,
+  options: SearchRequestOptions = {}
+): Promise<SearchResponse> {
+  const payload = {
+    query,
+    offset: options.offset ?? 0,
+    limit: options.limit ?? 20,
+    mode: options.mode ?? 'none',
+    bm25Enabled: options.bm25Enabled ?? true,
+    hybridRatio: options.hybridRatio ?? 50
+  }
+
+  const endpoint = options.useHybrid ? '/api/search/hybrid' : '/api/search'
 
   try {
-    const response = await fetch(`${SERVER_BASE_URL}/api/search`, {
+    const response = await fetch(`${SERVER_BASE_URL}${endpoint}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
@@ -28,6 +73,7 @@ export async function searchDocuments(query: string): Promise<SearchResponse> {
     if (!response.ok) {
       return {
         success: false,
+        data: [],
         error: `Request failed with status ${response.status}`
       }
     }
@@ -39,6 +85,7 @@ export async function searchDocuments(query: string): Promise<SearchResponse> {
 
     return {
       success: false,
+      data: [],
       error: `Search request failed: ${message}`
     }
   }
