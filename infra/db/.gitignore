@@ -1,0 +1,7 @@
+.env
+.env.local
+.env.*.local
+pgvector/data/
+pgadmin/data/
+__pycache__/
+*.pyc

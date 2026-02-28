@@ -3,6 +3,8 @@
 
 pgadmin/data/
 pgvector/data/
+infra/db/pgadmin/data/
+infra/db/pgvector/data/
 
 *.log
 node_modules/

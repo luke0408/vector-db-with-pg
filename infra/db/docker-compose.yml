@@ -1,0 +1,26 @@
+services:
+  pgadmin:
+    image: "dpage/pgadmin4:latest"
+    container_name: pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: "${PGADMIN_DEFAULT_EMAIL}"
+      PGADMIN_DEFAULT_PASSWORD: "${PGADMIN_DEFAULT_PASSWORD}"
+    volumes:
+      - "./pgadmin/data:/var/lib/pgadmin"
+    ports:
+      - "${PGADMIN_PORT:-8112}:80"
+
+  pgvector:
+    image: "pgvector/pgvector:pg17"
+    platform: "${DOCKER_PLATFORM:-linux/arm64}"
+    container_name: pgvector
+    build:
+      context: .
+      dockerfile: Dockerfile.pgvector
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+    volumes:
+      - "./pgvector/data:/var/lib/postgresql/data"
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
