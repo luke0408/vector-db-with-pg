@@ -5,3 +5,11 @@ pgadmin/data/
 pgvector/data/
 
 *.log
+node_modules/
+apps/*/node_modules/
+apps/*/dist/
+apps/*/.vite/
+coverage/
+tmp/
+*.tsbuildinfo
+data/*.parquet

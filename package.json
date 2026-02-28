@@ -1,0 +1,21 @@
+{
+  "name": "vector-db-with-pg",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "dev:web": "npm --workspace @vector-search/web run dev",
+    "dev:server": "npm --workspace @vector-search/server run start:dev",
+    "build": "npm run build:web && npm run build:server",
+    "build:web": "npm --workspace @vector-search/web run build",
+    "build:server": "npm --workspace @vector-search/server run build",
+    "test": "npm run test:web && npm run test:server",
+    "test:web": "npm --workspace @vector-search/web run test",
+    "test:server": "npm --workspace @vector-search/server run test",
+    "typecheck": "npm run typecheck:web && npm run typecheck:server",
+    "typecheck:web": "npm --workspace @vector-search/web run typecheck",
+    "typecheck:server": "npm --workspace @vector-search/server run typecheck"
+  }
+}

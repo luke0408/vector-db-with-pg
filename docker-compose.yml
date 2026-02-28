@@ -1,6 +1,37 @@
-version: "3.9"
-
 services:
+  web:
+    image: "node:22-alpine"
+    container_name: vector-web
+    working_dir: /workspace
+    command: ["sh", "-c", "npm install && npm run dev:web"]
+    volumes:
+      - "./:/workspace"
+    ports:
+      - "${WEB_PORT:-5173}:5173"
+    environment:
+      VITE_SERVER_URL: "http://localhost:${SERVER_PORT:-3000}"
+    depends_on:
+      - server
+
+  server:
+    image: "node:22-alpine"
+    container_name: vector-server
+    working_dir: /workspace
+    command: ["sh", "-c", "npm install && npm run dev:server"]
+    volumes:
+      - "./:/workspace"
+    ports:
+      - "${SERVER_PORT:-3000}:3000"
+    environment:
+      PORT: 3000
+      PGHOST: pgvector
+      PGPORT: 5432
+      PGUSER: "${POSTGRES_USER}"
+      PGPASSWORD: "${POSTGRES_PASSWORD}"
+      PGDATABASE: "${POSTGRES_DB:-${POSTGRES_USER}}"
+    depends_on:
+      - pgvector
+
   pgadmin:
     image: "dpage/pgadmin4:latest"
     container_name: pgadmin
@@ -14,7 +45,11 @@ services:
 
   pgvector:
     image: "pgvector/pgvector:pg17"
+    platform: "${DOCKER_PLATFORM:-linux/arm64}"
     container_name: pgvector
+    build:
+      context: .
+      dockerfile: Dockerfile.pgvector
     environment:
       POSTGRES_USER: "${POSTGRES_USER}"
       POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
