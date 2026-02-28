@@ -1,94 +1,237 @@
-# Nest Server Requirements for Vector Search Learning and Benchmarking
+# Nest Server Requirements for Vector Search Learning and Benchmarking (v1 Focus)
 
 ## 1) Objective
 
-- Build a NestJS service that supports vector search learning, experimentation, and performance evaluation on top of PostgreSQL + pgvector.
-- Reuse existing `namuwiki_documents` schema from `sql/init.sql` and keep docker-compose as the primary local execution environment.
+- Build a NestJS service for pgvector learning, search experimentation, and benchmark preparation on top of PostgreSQL + pgvector.
+- Reuse `namuwiki_documents` schema from `sql/init.sql`.
+- Keep docker-compose as the primary local runtime.
+- In v1, prioritize learning visibility features from web UI: `Generated SQL`, `Query Execution Plan`, and `Query Explanation`.
 
-## 2) Functional Requirements
+## 2) Scope and Version Policy
 
-- `FR-1`: Provide document search endpoint with vector similarity (`cosine`, `l2`, `inner product`) and top-k.
-- `FR-2`: Provide hybrid retrieval endpoint combining vector similarity with PostgreSQL full-text matching on `search_vector`.
-- `FR-3`: Provide metadata filtering (namespace, contributor, title keyword) and pagination for all search endpoints.
-- `FR-4`: Provide benchmark execution endpoint that runs predefined query sets and returns aggregate metrics.
-- `FR-5`: Provide ingestion orchestration endpoint to trigger/observe embedding generation jobs without replacing existing Python pipeline.
-- `FR-6`: Provide index management endpoint set for creating and inspecting pgvector indexes (HNSW, IVFFlat) in non-production mode.
-- `FR-7`: Provide experiment profile endpoint to store and replay benchmark parameters.
+- This document is **v1/v1.5 only**. v2 is out of scope.
+- Endpoint naming is unified to `/api/*`.
+- Health endpoint must be `GET /api/health`.
+- `POST /api/search` response `data` must always be an array.
+- Pagination baseline in v1 is **offset-based**.
 
-## 3) API Requirements
+## 3) Functional Requirements
 
-- `POST /api/search`: vector-only search.
-- `POST /api/search/hybrid`: vector + full-text hybrid search.
-- `POST /api/benchmark/run`: execute benchmark scenarios.
-- `GET /api/benchmark/:runId`: fetch benchmark result summary.
-- `POST /api/ingest/jobs`: create ingestion/embedding job metadata.
-- `GET /api/health`: readiness/liveness check including DB connectivity.
+### MUST (v1)
 
-All responses should follow the existing API response pattern:
+- `FR-1`: Provide `POST /api/search` for vector-oriented search with top-k and offset pagination.
+- `FR-2`: Provide learning visibility fields for search:
+  - generated SQL string
+  - execution plan (JSON)
+  - query explanation (human-readable summary)
+- `FR-3`: Support metadata filtering baseline (title keyword required, namespace/contributor optional in v1.5).
+- `FR-4`: `GET /api/health` must check readiness/liveness including DB connectivity.
+
+### SHOULD (v1.5)
+
+- `FR-5`: Provide `POST /api/search/hybrid` combining vector similarity and PostgreSQL full-text (`search_vector`).
+- `FR-6`: Support request options that match current web controls:
+  - search mode (`none`, `hnsw`, `ivf`)
+  - BM25 toggle
+  - hybrid ratio
+
+### LATER (post-v1.5)
+
+- `FR-7`: Benchmark execution endpoint and run-summary endpoint.
+- `FR-8`: Ingestion orchestration endpoint for embedding job metadata.
+- `FR-9`: Index management endpoints (HNSW, IVFFlat) in non-production mode.
+- `FR-10`: Experiment profile store/replay endpoint.
+
+## 4) API Requirements
+
+### 4.1 Required Endpoints (v1/v1.5)
+
+- `POST /api/search`
+- `GET /api/health`
+- `POST /api/search/hybrid` (v1.5)
+
+### 4.2 Deferred Endpoints (LATER)
+
+- `POST /api/benchmark/run`
+- `GET /api/benchmark/:runId`
+- `POST /api/ingest/jobs`
+- `POST /api/indexes/*`
+- `POST /api/experiments/*`
+
+### 4.3 Response Envelope Policy (v1 fixed)
 
 ```ts
 interface ApiResponse<T> {
   success: boolean
-  data?: T
+  data: T[]
   error?: string
   meta?: {
     total: number
-    page: number
+    offset: number
     limit: number
+    tookMs?: number
+    requestId?: string
   }
 }
 ```
 
-## 4) Data and Index Requirements
+- `data` is always present and always an array, even on empty results.
 
-- Preserve compatibility with `VECTOR(384)` embedding shape used by `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`.
-- Validate embedding dimension at API boundary before DB query execution.
-- Provide migration scripts for index strategy experiments:
-  - HNSW for low-latency approximate retrieval.
-  - IVFFlat for memory-aware workloads.
-- Ensure text search config fallback (`korean` -> `simple`) remains consistent with current DB initialization behavior.
+### 4.4 `POST /api/search` Contract (v1 fixed)
 
-## 5) Non-Functional Requirements
+Request:
 
-- `NFR-1`: p95 search latency under 300ms for top-10 on local benchmark corpus (baseline profile).
-- `NFR-2`: p99 search latency under 500ms for hybrid search in baseline profile.
-- `NFR-3`: Throughput target at least 50 requests/sec under mixed read workload on local docker profile.
-- `NFR-4`: Input validation using schema validators on all external request payloads.
-- `NFR-5`: Structured logs with request ID and benchmark run ID correlation.
-- `NFR-6`: No secrets hardcoded; environment-only secret resolution.
+```ts
+interface SearchRequestV1 {
+  query: string
+  offset?: number
+  limit?: number
+}
+```
 
-## 6) Evaluation Requirements
+Response item:
 
-- Accuracy metrics:
-  - Recall@K
-  - MRR
-  - nDCG
-- Performance metrics:
-  - p50/p95/p99 latency
-  - Throughput (RPS)
-  - Error rate
-- Reproducibility requirements:
-  - benchmark profile must capture dataset slice, model, index type, query set, and search parameters.
-  - benchmark run must be replayable in docker-compose environment.
+```ts
+interface SearchResultV1 {
+  id: number
+  title: string
+  snippet: string
+  score: number
+  // Optional learning fields for current web rendering compatibility
+  category?: string
+  distance?: number
+  tags?: string[]
+  matchRate?: number
+}
+```
 
-## 7) Security and Reliability Requirements
+Response data shape:
 
-- Parameterized SQL only; no string interpolation in raw queries.
-- Rate limit search endpoints and benchmark endpoints separately.
-- Error responses must not expose SQL, credentials, or stack traces in production mode.
-- Idempotency key support for benchmark runs to prevent accidental duplicate heavy jobs.
+```ts
+interface SearchResponseV1Data {
+  items: SearchResultV1[]
+  learning: {
+    generatedSql: string
+    executionPlan: Record<string, unknown>
+    queryExplanation: string
+  }
+}
+```
 
-## 8) Docker-Compose Alignment Requirements
+Note: To keep `data` always as array under global policy, `POST /api/search` returns:
+
+```ts
+ApiResponse<SearchResponseV1Data>
+```
+
+with one element in `data` containing `items` + `learning`.
+
+### 4.5 `POST /api/search/hybrid` Contract (v1.5)
+
+Request:
+
+```ts
+interface SearchHybridRequestV15 {
+  query: string
+  offset?: number
+  limit?: number
+  mode?: 'none' | 'hnsw' | 'ivf'
+  bm25Enabled?: boolean
+  hybridRatio?: number // 0..100
+}
+```
+
+Response follows same envelope and learning fields policy as `POST /api/search`.
+
+## 5) Data and Index Requirements
+
+- Preserve compatibility with `VECTOR(384)` embedding shape.
+- Validate embedding dimension at API boundary before DB execution.
+- Keep text search config fallback (`korean` -> `simple`) aligned with DB init.
+- In v1, index strategy APIs are deferred, but query plan output must expose whether index scan or sequential scan is used for learning.
+
+## 6) Non-Functional Requirements
+
+- `NFR-1`: p95 latency under 300ms for top-10 baseline search in local profile.
+- `NFR-2`: p99 latency under 500ms for hybrid search baseline (v1.5).
+- `NFR-3`: Throughput target >= 50 RPS under mixed read workload.
+- `NFR-4`: Schema validation for all external request payloads.
+- `NFR-5`: Structured logs with request ID and correlation IDs.
+- `NFR-6`: No hardcoded secrets; environment-only resolution.
+
+## 7) Evaluation Requirements
+
+- Accuracy metrics: Recall@K, MRR, nDCG.
+- Performance metrics: p50/p95/p99 latency, RPS, error rate.
+- Reproducibility:
+  - benchmark profile captures dataset slice, model, index type, query set, parameters.
+  - benchmark run replayable in docker-compose.
+
+## 8) Security and Reliability Requirements
+
+- Parameterized SQL only; no unsafe string interpolation.
+- Separate rate limits for search endpoints and benchmark endpoints.
+- Production error responses must not expose SQL, credentials, stack traces.
+- Idempotency key required for benchmark run creation (LATER scope).
+- Learning visibility fields (`generatedSql`, `executionPlan`, `queryExplanation`) must support environment-based exposure control (dev/restricted modes).
+
+## 9) Docker-Compose Alignment Requirements
 
 - Service connectivity defaults:
   - server -> `pgvector:5432` inside compose network.
-  - web -> `server:3000` inside compose network; browser access via exposed host port.
-- Health checks required for server and pgvector before benchmark jobs can start.
-- Local workflow must remain one-command bring-up with `docker compose up -d --build`.
+  - web -> `server:3000` inside compose network; browser access via host port.
+- Health checks for server and pgvector required before benchmark jobs start.
+- One-command local bring-up must remain: `docker compose up -d --build`.
 
-## 9) Acceptance Criteria
+## 10) Acceptance Criteria (Measurable)
 
-- A user can run web + server + pgvector via docker-compose and perform a successful vector search request end-to-end.
-- Benchmark endpoint can execute at least one profile and return metrics with persisted run ID.
-- Search outputs include similarity score and metadata fields needed for learning analysis.
-- Regression tests cover unit + integration flows around search and benchmark orchestration.
+- `AC-1` (v1): web + server + pgvector run in docker-compose; `POST /api/search` succeeds end-to-end.
+- `AC-2` (v1): `GET /api/health` returns app+DB readiness.
+- `AC-3` (v1): search response includes learning fields:
+  - generated SQL
+  - execution plan
+  - query explanation
+- `AC-4` (v1): `data` field is always an array and offset pagination works.
+- `AC-5` (v1.5): `/api/search/hybrid` supports mode/BM25/hybrid ratio.
+
+## 11) Current Code Baseline Notes
+
+- Current endpoints in code: `POST /api/search`, `GET /health` (must migrate to `/api/health`).
+- Current web API client contract: `{ query }` request, `{ success, data?, error? }` response.
+- Current web UI contains visible learning panels (`Generated SQL`, `Query Execution Plan`, `Scoring Breakdown`) and expects to surface explainability artifacts.
+
+## 12) TODO (Implementation Checklist)
+
+### Phase 0 - Contract Freeze (MUST)
+
+- [ ] Update server health path to `GET /api/health`.
+- [ ] Enforce `ApiResponse<T>` policy with `data` always array.
+- [ ] Add offset pagination params (`offset`, `limit`) and response `meta`.
+- [ ] Define score semantics and document `distance`/`matchRate` usage.
+
+### Phase 1 - Core Search + Learning Visibility (MUST)
+
+- [ ] Return `generatedSql` in search response.
+- [ ] Return execution plan JSON (`EXPLAIN ... FORMAT JSON`) in search response.
+- [ ] Return `queryExplanation` summary in search response.
+- [ ] Add validation and error policy coverage tests.
+
+### Phase 1.5 - Hybrid Controls (SHOULD)
+
+- [ ] Implement `POST /api/search/hybrid`.
+- [ ] Wire mode/BM25/hybrid ratio request options.
+- [ ] Validate hybrid ratio bounds and fallback behavior.
+
+### Phase 2 - Benchmark/Index/Experiment (LATER)
+
+- [ ] Implement benchmark run/result endpoints.
+- [ ] Implement ingest job metadata endpoint.
+- [ ] Implement non-production index management endpoints.
+- [ ] Implement experiment profile persistence/replay.
+
+### Quality and Security Gates
+
+- [ ] Add structured request/benchmark correlation logging.
+- [ ] Add rate limiting by endpoint class.
+- [ ] Gate learning debug fields by environment policy.
+- [ ] Add regression tests (unit + integration) for search and orchestration flows.
