@@ -87,32 +87,7 @@ PR 생성 시:
 2. git diff로 모든 변경사항 확인
 3. 포괄적인 PR 요약 작성
 4. TODO가 포함된 테스트 계획 포함
-5. 새 브랜치인 경우 -u 플래그로 푸시
-6. PR template 사용: .github/pull_request_template.md
-
-## 브랜치 전략
-
-```
-main
-├── develop
-├── feat/*
-└── hotfix/*
-```
-
-### 허용 브랜치 이름
-
-- `main`
-- `develop`
-- `feat/*`
-- `hotfix/*`
-
-### 브랜치 운용 규칙
-
-1. 일반 개발 작업은 반드시 `feat/*` 브랜치에서 진행합니다.
-2. `feat/*` 브랜치는 `develop`으로 머지합니다.
-3. 긴급 수정은 반드시 `main`에서 `hotfix/*`로 분기합니다.
-4. `hotfix/*` 브랜치는 `main`으로 머지합니다.
-5. hotfix 완료 후에는 `main`과 `develop`을 반드시 동기화합니다.
+5. PR template 사용: .github/pull_request_template.md
 
 ## 머지 전 체크리스트
 

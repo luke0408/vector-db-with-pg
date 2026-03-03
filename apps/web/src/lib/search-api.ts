@@ -7,12 +7,29 @@ export interface SearchResult {
   distance?: number
   tags?: string[]
   matchRate?: number
+  usedKeywords?: string[]
+  matchedKeywords?: string[]
+}
+
+export interface SearchKeywordSignal {
+  keyword: string
+  weight: number
 }
 
 export interface SearchLearningData {
   generatedSql: string
   executionPlan: Record<string, unknown>
   queryExplanation: string
+  keywordSignals?: SearchKeywordSignal[]
+  pipelineTimings?: {
+    normalizeAndAnalyzeMs: number
+    seedLookupMs: number
+    annQueryMs: number
+    resultAssembleMs: number
+    totalPipelineMs: number
+    seedLookupAttempts: number
+    seedFound: boolean
+  }
 }
 
 export interface SearchResponseData {

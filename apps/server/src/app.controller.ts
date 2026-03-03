@@ -44,11 +44,26 @@ interface SearchResultData {
     distance?: number
     tags?: string[]
     matchRate?: number
+    usedKeywords?: string[]
+    matchedKeywords?: string[]
   }>
   learning: {
     generatedSql: string
     executionPlan: Record<string, unknown>
     queryExplanation: string
+    keywordSignals?: Array<{
+      keyword: string
+      weight: number
+    }>
+    pipelineTimings?: {
+      normalizeAndAnalyzeMs: number
+      seedLookupMs: number
+      annQueryMs: number
+      resultAssembleMs: number
+      totalPipelineMs: number
+      seedLookupAttempts: number
+      seedFound: boolean
+    }
   }
 }
 

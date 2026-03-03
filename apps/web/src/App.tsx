@@ -30,6 +30,8 @@ export function App() {
   const [meta, setMeta] = useState<SearchMeta | undefined>()
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(false)
+  const [sqlCopied, setSqlCopied] = useState(false)
+  const [planCopied, setPlanCopied] = useState(false)
 
   const totalMatches = meta?.total ?? results.length
   const searchTime = meta?.tookMs ?? 0
@@ -48,6 +50,11 @@ export function App() {
 
     return Number((1 - vectorScore).toFixed(3))
   }, [bm25Enabled, vectorScore])
+
+  const topKeywordSignals = useMemo(
+    () => (learning.keywordSignals ?? []).slice(0, 5),
+    [learning.keywordSignals]
+  )
 
   const handleSearch = async (nextOffset: number) => {
     setIsLoading(true)
@@ -101,6 +108,19 @@ export function App() {
     () => JSON.stringify(learning.executionPlan, null, 2),
     [learning.executionPlan]
   )
+
+  const handleCopy = async (
+    text: string,
+    setCopied: (value: boolean) => void
+  ) => {
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1200)
+    } catch {
+      setCopied(false)
+    }
+  }
 
   return (
     <main className="app-shell">
@@ -193,9 +213,17 @@ export function App() {
             <article className="panel insight-panel">
               <header className="panel-title-row">
                 <strong>Generated SQL</strong>
-                <button type="button" onClick={() => setShowSql((previous) => !previous)}>
-                  {showSql ? 'Collapse' : 'Expand'}
-                </button>
+                <div className="panel-actions">
+                  <button
+                    type="button"
+                    onClick={() => void handleCopy(learning.generatedSql, setSqlCopied)}
+                  >
+                    {sqlCopied ? 'Copied' : 'Copy'}
+                  </button>
+                  <button type="button" onClick={() => setShowSql((previous) => !previous)}>
+                    {showSql ? 'Collapse' : 'Expand'}
+                  </button>
+                </div>
               </header>
               {showSql ? <pre className="code-block">{learning.generatedSql}</pre> : null}
             </article>
@@ -203,9 +231,14 @@ export function App() {
             <article className="panel insight-panel">
               <header className="panel-title-row">
                 <strong>Query Execution Plan</strong>
-                <button type="button" onClick={() => setShowPlan((previous) => !previous)}>
-                  {showPlan ? 'Collapse' : 'Expand'}
-                </button>
+                <div className="panel-actions">
+                  <button type="button" onClick={() => void handleCopy(executionPlanText, setPlanCopied)}>
+                    {planCopied ? 'Copied' : 'Copy'}
+                  </button>
+                  <button type="button" onClick={() => setShowPlan((previous) => !previous)}>
+                    {showPlan ? 'Collapse' : 'Expand'}
+                  </button>
+                </div>
               </header>
               {showPlan ? <pre className="code-block">{executionPlanText}</pre> : null}
             </article>
@@ -268,6 +301,21 @@ export function App() {
                 </div>
               </div>
             </article>
+
+            <article className="panel insight-panel">
+              <header className="panel-title-row">
+                <strong>Keyword Signals</strong>
+              </header>
+              <div className="result-tags">
+                {topKeywordSignals.length > 0
+                  ? topKeywordSignals.map((signal) => (
+                      <span key={`signal-${signal.keyword}`}>
+                        {signal.keyword} ({(signal.weight * 100).toFixed(1)}%)
+                      </span>
+                    ))
+                  : [<span key="signal-empty">No keyword signals yet</span>]}
+              </div>
+            </article>
           </div>
 
           <div className="right-column">
@@ -297,6 +345,13 @@ export function App() {
                       <span key={`${result.id}-${tag}`}>{tag}</span>
                     ))}
                   </div>
+                  {result.matchedKeywords && result.matchedKeywords.length > 0 ? (
+                    <div className="result-tags">
+                      {result.matchedKeywords.map((keyword) => (
+                        <span key={`${result.id}-keyword-${keyword}`}>matched: {keyword}</span>
+                      ))}
+                    </div>
+                  ) : null}
                 </article>
               ))}
             </div>

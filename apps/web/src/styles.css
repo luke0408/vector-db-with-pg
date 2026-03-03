@@ -228,6 +228,12 @@ body,
   background: rgba(19, 127, 236, 0.08);
 }
 
+.panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
 .code-block {
   margin: 0;
   padding: 1rem;
