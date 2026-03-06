@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common'
 import { PrismaService } from './prisma/prisma.service'
+import { QueryEmbeddingService } from './query-embedding.service'
 import type { EmbeddingModel } from './types/search-contract'
 
 export interface SearchResult {
@@ -66,6 +67,18 @@ interface HybridSearchRow {
   bm25_score?: number
 }
 
+interface LexicalFallbackRow {
+  id: bigint
+  title: string | null
+  snippet: string
+  namespace: string | null
+  contributors: string | null
+  bm25_score?: number
+  title_match: boolean
+  like_title_match: boolean
+  like_content_match: boolean
+}
+
 interface SearchExecutionResult {
   items: SearchResult[]
   total: number
@@ -96,7 +109,10 @@ export class AppService {
   private static readonly KOREAN_POSTPOSITION_SUFFIX_PATTERN =
     /(은|는|이|가|을|를|의|에|에서|으로|로|와|과|에게|한테|께|도|만|부터|까지|처럼|보다|랑)$/u
 
-  constructor(private readonly prismaService: PrismaService) {}
+  constructor(
+    private readonly prismaService: PrismaService,
+    private readonly queryEmbeddingService: QueryEmbeddingService
+  ) {}
 
   async health() {
     let database = 'up'
@@ -109,12 +125,15 @@ export class AppService {
       status = 'degraded'
     }
 
+    const queryEmbedding = this.queryEmbeddingService.getHealthStatus()
+
     return {
       success: database === 'up',
       data: {
         status,
         service: 'vector-search-server',
-        database
+        database,
+        prewarm: queryEmbedding
       }
     }
   }
@@ -174,6 +193,7 @@ export class AppService {
     `
 
     const explainSql = `EXPLAIN (FORMAT JSON) ${searchSql}`
+    const includeExplain = this.shouldIncludeExplain()
 
     try {
       const [rawRows, countRows, planRows] = await Promise.all([
@@ -187,15 +207,17 @@ export class AppService {
           options.offset
         ),
         this.prismaService.$queryRawUnsafe(countSql, queryPattern, queryPattern),
-        this.prismaService.$queryRawUnsafe(
-          explainSql,
-          queryPattern,
-          queryPattern,
-          queryPattern,
-          queryPattern,
-          options.limit,
-          options.offset
-        )
+        includeExplain
+          ? this.prismaService.$queryRawUnsafe(
+              explainSql,
+              queryPattern,
+              queryPattern,
+              queryPattern,
+              queryPattern,
+              options.limit,
+              options.offset
+            )
+          : Promise.resolve([])
       ])
 
       const rows = rawRows as Array<{
@@ -211,9 +233,12 @@ export class AppService {
         ((countRows as Array<{ total: bigint }>)[0]?.total ?? BigInt(0)).toString()
       )
 
-      const executionPlan = this.parseExecutionPlan(
-        planRows as Array<Record<string, unknown>>
-      )
+      const executionPlan = includeExplain
+        ? this.parseExecutionPlan(planRows as Array<Record<string, unknown>>)
+        : {}
+      const queryExplanation = includeExplain
+        ? this.buildQueryExplanation(executionPlan)
+        : 'Execution plan omitted because SEARCH_INCLUDE_EXPLAIN is disabled.'
 
       return {
         items: rows.map((row) => {
@@ -233,7 +258,7 @@ export class AppService {
         learning: {
           generatedSql: searchSql.trim(),
           executionPlan,
-          queryExplanation: this.buildQueryExplanation(executionPlan)
+          queryExplanation
         }
       }
     } catch (error) {
@@ -248,7 +273,8 @@ export class AppService {
     const pipelineStartedAt = Date.now()
     const analyzeStartedAt = Date.now()
     const tsConfig = 'korean'
-    const normalizedQuery = query.trim().toLowerCase()
+    const trimmedQuery = query.trim()
+    const normalizedQuery = trimmedQuery.toLowerCase()
 
     if (!normalizedQuery) {
       return {
@@ -266,10 +292,10 @@ export class AppService {
     const queryTerms = this.extractQueryTerms(normalizedQuery)
 
     if (queryTerms.length === 0) {
-      return {
-        items: [],
-        total: 0,
-        learning: {
+        return {
+          items: [],
+          total: 0,
+          learning: {
           generatedSql: '-- query has no indexable keywords after normalization',
           executionPlan: {},
           queryExplanation: 'Query normalization produced no searchable keywords.',
@@ -286,33 +312,9 @@ export class AppService {
       }
     }
 
-    const isShortAmbiguousQuery = queryTerms.length <= 1 && normalizedQuery.length <= 2
     const isLongNaturalLanguageQuery = queryTerms.length >= 4 || normalizedQuery.length >= 16
-    const hasDomainAnchor = this.hasDomainAnchor(queryTerms)
-    const shouldPreferTitleSeed =
-      (queryTerms.length >= 2 && !isLongNaturalLanguageQuery) ||
-      (hasDomainAnchor && queryTerms.length >= 2)
     const keywordSignals = this.buildKeywordSignals(queryTerms, isLongNaturalLanguageQuery)
     const weightedKeywords = keywordSignals.map((signal) => signal.keyword)
-    const seedQueryExpression = this.buildTsQueryExpression(
-      weightedKeywords,
-      4,
-      '|'
-    )
-    const rankQueryExpression = this.buildTsQueryExpression(
-      weightedKeywords,
-      3,
-      '&'
-    )
-    const titleQueryExpression = this.buildTsQueryExpression(
-      weightedKeywords,
-      isLongNaturalLanguageQuery ? 3 : 2,
-      '|'
-    )
-    const technicalTerms = this.extractTechnicalTerms(queryTerms)
-    const technicalSeedExpression = this.buildTsQueryExpression(technicalTerms, 3, '|')
-    const technicalRankExpression = this.buildTsQueryExpression(technicalTerms, 2, '&')
-    const hasTechnicalFocus = technicalTerms.length > 0 && technicalSeedExpression.length > 0
     const effectiveMode: 'hnsw' | 'ivf' = options.mode === 'ivf' ? 'ivf' : 'hnsw'
     const semanticWeight = options.bm25Enabled ? Number((options.hybridRatio / 100).toFixed(3)) : 1
     const keywordWeight = options.bm25Enabled ? Number((1 - semanticWeight).toFixed(3)) : 0
@@ -323,58 +325,13 @@ export class AppService {
       ? 'namuwiki_document_embeddings_qwen qe JOIN namuwiki_documents d ON d.doc_hash = qe.doc_hash'
       : 'namuwiki_documents d'
     const embeddingExpr = options.embeddingModel === 'qwen3' ? 'qe.embedding' : 'd.embedding'
-
-    const seedTitleVectorSql = `
-      SELECT ${embeddingExpr}::text AS query_vector
-      FROM ${sourceJoin}
-      WHERE ${embeddingExpr} IS NOT NULL
-        AND to_tsvector('korean', COALESCE(d.title, '')) @@ to_tsquery('korean', $1)
-      ORDER BY d.id DESC
-      LIMIT 1
-    `
-
-    const queryVectorSql = `
-      SELECT ${embeddingExpr}::text AS query_vector
-      FROM ${sourceJoin}
-      WHERE d.search_vector @@ to_tsquery('korean', $1)
-        AND ${embeddingExpr} IS NOT NULL
-      ORDER BY
-        CASE
-          WHEN to_tsvector('korean', COALESCE(d.title, '')) @@ to_tsquery('korean', $2) THEN 1
-          ELSE 0
-        END DESC,
-        id DESC
-      LIMIT 1
-    `
-
-    const queryVectorFastSql = `
-      SELECT ${embeddingExpr}::text AS query_vector
-      FROM ${sourceJoin}
-      WHERE d.search_vector @@ to_tsquery('korean', $1)
-        AND ${embeddingExpr} IS NOT NULL
-      ORDER BY d.id DESC
-      LIMIT 1
-    `
-
-    const fallbackVectorSql = `
-      SELECT ${embeddingExpr}::text AS query_vector
-      FROM ${sourceJoin}
-      WHERE ${embeddingExpr} IS NOT NULL
-        AND (
-          LOWER(COALESCE(d.title, '')) LIKE $1
-          OR LOWER(d.content) LIKE $2
-        )
-      ORDER BY CASE
-          WHEN LOWER(COALESCE(d.title, '')) LIKE $1 THEN 2
-          WHEN LOWER(d.content) LIKE $2 THEN 1
-          ELSE 0
-        END DESC,
-        d.id DESC
-      LIMIT 1
-    `
-
     const distanceOperator = effectiveMode === 'ivf' ? '<#>' : '<=>'
-    const poolMultiplier = isShortAmbiguousQuery ? 25 : isLongNaturalLanguageQuery ? 12 : 18
+    const poolMultiplier =
+      queryTerms.length <= 1 && normalizedQuery.length <= 2
+        ? 25
+        : isLongNaturalLanguageQuery
+          ? 12
+          : 18
     const candidatePool = Math.max(options.limit + options.offset, 20) * poolMultiplier
 
     const annSql = `
@@ -397,7 +354,7 @@ export class AppService {
           ann_candidates.vector_distance,
           CASE
             WHEN $3::boolean = true
-              THEN ts_rank_cd(COALESCE(d.search_vector, ''::tsvector), to_tsquery('${tsConfig}', $4), 32)
+              THEN ts_rank_cd(COALESCE(d.search_vector, ''::tsvector), plainto_tsquery('${tsConfig}', $4), 32)
             ELSE 0
           END AS bm25_score
         FROM ann_candidates
@@ -448,98 +405,53 @@ export class AppService {
     `
 
     const explainSql = `EXPLAIN (FORMAT JSON) ${annSql}`
+    const includeExplain = this.shouldIncludeExplain()
 
     try {
-      let queryVector: string | null | undefined
-      let seedLookupAttempts = 0
-      const seedLookupStartedAt = Date.now()
-
-      if (hasTechnicalFocus) {
-        seedLookupAttempts += 1
-        const technicalTitleSeedRows = (await this.prismaService.$queryRawUnsafe(
-          seedTitleVectorSql,
-          technicalSeedExpression
-        )) as Array<{ query_vector: string | null }>
-
-        queryVector = technicalTitleSeedRows[0]?.query_vector
-      }
-
-      if (!queryVector && (isShortAmbiguousQuery || shouldPreferTitleSeed)) {
-        seedLookupAttempts += 1
-        const titleSeedRows = (await this.prismaService.$queryRawUnsafe(
-          seedTitleVectorSql,
-          titleQueryExpression
-        )) as Array<{ query_vector: string | null }>
-
-        queryVector = titleSeedRows[0]?.query_vector
-      }
-
-      if (!queryVector && hasTechnicalFocus) {
-        seedLookupAttempts += 1
-        const technicalPrimaryExpression = technicalRankExpression || technicalSeedExpression
-        const technicalQueryVectorRows = (await this.prismaService.$queryRawUnsafe(
-          queryVectorSql,
-          technicalPrimaryExpression,
-          technicalSeedExpression
-        )) as Array<{ query_vector: string | null }>
-
-        queryVector = technicalQueryVectorRows[0]?.query_vector
-      }
+      const vectorPreparationStartedAt = Date.now()
+      const embeddingsAvailable = await this.hasEmbeddings(options.embeddingModel)
+      const queryEmbeddingAttempt = embeddingsAvailable
+        ? await this.queryEmbeddingService.embedQuery(trimmedQuery, options.embeddingModel)
+        : {
+            reason: `embedding-store-empty:${options.embeddingModel}`
+          }
+      const queryVector = queryEmbeddingAttempt.vectorLiteral ?? null
+      const queryEmbeddingReason =
+        queryVector !== null
+          ? 'model-generated'
+          : (queryEmbeddingAttempt.reason ?? 'query-embedding-unavailable')
+      const seedLookupMs = Date.now() - vectorPreparationStartedAt
+      const seedLookupAttempts = embeddingsAvailable ? 1 : 0
 
       if (!queryVector) {
-        seedLookupAttempts += 1
-        const queryVectorRows = (isLongNaturalLanguageQuery && !hasDomainAnchor
-          ? await this.prismaService.$queryRawUnsafe(queryVectorFastSql, rankQueryExpression)
-          : await this.prismaService.$queryRawUnsafe(
-              queryVectorSql,
-              rankQueryExpression,
-              titleQueryExpression
-            )) as Array<{ query_vector: string | null }>
+        if (options.bm25Enabled) {
+          return this.searchHybridLexicalFallback(
+            query,
+            normalizedQuery,
+            queryPattern,
+            weightedKeywords,
+            keywordSignals,
+            options,
+            tsConfig,
+            normalizeAndAnalyzeMs,
+            seedLookupMs,
+            seedLookupAttempts,
+            pipelineStartedAt,
+            queryEmbeddingReason
+          )
+        }
 
-        queryVector = queryVectorRows[0]?.query_vector
-      }
+        const lexicalFallbackResult = await this.search(query, options)
 
-      if (!queryVector && !isShortAmbiguousQuery) {
-        seedLookupAttempts += 1
-        const relaxedQueryVectorRows = (isLongNaturalLanguageQuery && !hasDomainAnchor
-          ? await this.prismaService.$queryRawUnsafe(queryVectorFastSql, seedQueryExpression)
-          : await this.prismaService.$queryRawUnsafe(
-              queryVectorSql,
-              seedQueryExpression,
-              titleQueryExpression
-            )) as Array<{ query_vector: string | null }>
-
-        queryVector = relaxedQueryVectorRows[0]?.query_vector
-      }
-
-      if (!queryVector && isShortAmbiguousQuery) {
-        seedLookupAttempts += 1
-        const fallbackVectorRows = (await this.prismaService.$queryRawUnsafe(
-          fallbackVectorSql,
-          queryPattern,
-          queryPattern
-        )) as Array<{ query_vector: string | null }>
-
-        queryVector = fallbackVectorRows[0]?.query_vector
-      }
-
-      const seedLookupMs = Date.now() - seedLookupStartedAt
-
-      if (!queryVector) {
         return {
-          items: [],
-          total: 0,
+          items: lexicalFallbackResult.items,
+          total: lexicalFallbackResult.total,
           learning: {
+            ...lexicalFallbackResult.learning,
             generatedSql:
-              `${seedTitleVectorSql.trim()}\n${queryVectorSql.trim()}\n${queryVectorFastSql.trim()}\n${fallbackVectorSql.trim()}\n-- no seed embedding found for query, ANN skipped\n-- embeddingModel: ${options.embeddingModel}, mode: ${effectiveMode}, bm25: ${options.bm25Enabled}, hybridRatio: ${options.hybridRatio}, ranking: ${rankingStrategy}, technicalSeedTsQuery: ${technicalSeedExpression || 'none'}`,
-            executionPlan: {
-              Plan: {
-                'Node Type': 'Unavailable',
-                Reason: 'No seed embedding found for ANN query'
-              }
-            },
+              `${lexicalFallbackResult.learning.generatedSql}\n-- fallback: lexical-like, reason: ${queryEmbeddingReason}, embeddingModel: ${options.embeddingModel}`,
             queryExplanation:
-              'ANN mode requires at least one seed embedding from lexical full-text matching, but none was found.',
+              `${lexicalFallbackResult.learning.queryExplanation} Fell back to lexical LIKE search because ${queryEmbeddingReason}.`,
             keywordSignals,
             pipelineTimings: {
               normalizeAndAnalyzeMs,
@@ -561,7 +473,7 @@ export class AppService {
           queryVector,
           candidatePool,
           options.bm25Enabled,
-          rankQueryExpression,
+          normalizedQuery,
           semanticWeight,
           keywordWeight,
           effectiveMode === 'ivf',
@@ -573,18 +485,20 @@ export class AppService {
           queryVector,
           candidatePool
         ),
-        this.prismaService.$queryRawUnsafe(
-          explainSql,
-          queryVector,
-          candidatePool,
-          options.bm25Enabled,
-          rankQueryExpression,
-          semanticWeight,
-          keywordWeight,
-          effectiveMode === 'ivf',
-          options.limit,
-          options.offset
-        )
+        includeExplain
+          ? this.prismaService.$queryRawUnsafe(
+              explainSql,
+              queryVector,
+              candidatePool,
+              options.bm25Enabled,
+              normalizedQuery,
+              semanticWeight,
+              keywordWeight,
+              effectiveMode === 'ivf',
+              options.limit,
+              options.offset
+            )
+          : Promise.resolve([])
       ])
       const annQueryMs = Date.now() - annQueryStartedAt
       const resultAssembleStartedAt = Date.now()
@@ -595,9 +509,29 @@ export class AppService {
         ((countRows as Array<{ total: bigint }>)[0]?.total ?? BigInt(0)).toString()
       )
 
-      const executionPlan = this.parseExecutionPlan(
-        planRows as Array<Record<string, unknown>>
-      )
+      if ((rows.length === 0 || total === 0) && options.bm25Enabled) {
+        return this.searchHybridLexicalFallback(
+          query,
+          normalizedQuery,
+          queryPattern,
+          weightedKeywords,
+          keywordSignals,
+          options,
+          tsConfig,
+          normalizeAndAnalyzeMs,
+          seedLookupMs,
+          seedLookupAttempts,
+          pipelineStartedAt,
+          'ann-candidates-empty'
+        )
+      }
+
+      const executionPlan = includeExplain
+        ? this.parseExecutionPlan(planRows as Array<Record<string, unknown>>)
+        : {}
+      const queryExplanation = includeExplain
+        ? `${this.buildQueryExplanation(executionPlan)} Used model-generated query embedding. Keywords used: ${weightedKeywords.join(', ') || 'none'}.`
+        : `Execution plan omitted because SEARCH_INCLUDE_EXPLAIN is disabled. Used model-generated query embedding. Keywords used: ${weightedKeywords.join(', ') || 'none'}.`
 
       const mappedItems = rows.map((row) => {
           const vectorScore = this.toUnitInterval(
@@ -632,11 +566,12 @@ export class AppService {
 
       return {
         items: mappedItems,
-          total,
+        total,
         learning: {
-          generatedSql: `${seedTitleVectorSql.trim()}\n${queryVectorSql.trim()}\n${queryVectorFastSql.trim()}\n${fallbackVectorSql.trim()}\n${annSql.trim()}\n-- embeddingModel: ${options.embeddingModel}, mode: ${effectiveMode}, bm25: ${options.bm25Enabled}, hybridRatio: ${options.hybridRatio}, candidatePool: ${candidatePool}, tsConfig: ${tsConfig}, shortQueryStrategy: ${isShortAmbiguousQuery ? 'seed-priority' : 'standard'}, longQueryStrategy: ${isLongNaturalLanguageQuery ? 'term-selected-tsquery' : 'default'}, ranking: ${rankingStrategy}, domainAnchor: ${hasDomainAnchor ? 'on' : 'off'}, technicalSeedTsQuery: ${technicalSeedExpression || 'none'}, rankTsQuery: ${rankQueryExpression}`,
+          generatedSql:
+            `${annSql.trim()}\n-- queryVectorSource: runtime-query-embedding, queryEmbedding: ${queryEmbeddingReason}, embeddingModel: ${options.embeddingModel}, requestedMode: ${options.mode}, effectiveMode: ${effectiveMode}, bm25: ${options.bm25Enabled}, hybridRatio: ${options.hybridRatio}, candidatePool: ${candidatePool}, tsConfig: ${tsConfig}, ranking: ${rankingStrategy}, rankTsQuery: ${weightedKeywords.join(' ') || 'none'}, bm25TsQueryMode: plainto_tsquery`,
           executionPlan,
-          queryExplanation: `${this.buildQueryExplanation(executionPlan)} Keywords used: ${weightedKeywords.join(', ') || 'none'}.`,
+          queryExplanation,
           keywordSignals,
           pipelineTimings: {
             normalizeAndAnalyzeMs,
@@ -650,8 +585,259 @@ export class AppService {
         }
       }
     } catch (error) {
+      if (options.bm25Enabled) {
+        return this.searchHybridLexicalFallback(
+          query,
+          normalizedQuery,
+          queryPattern,
+          weightedKeywords,
+          keywordSignals,
+          options,
+          tsConfig,
+          normalizeAndAnalyzeMs,
+          0,
+          0,
+          pipelineStartedAt,
+          `ann-query-failed:${this.describeError(error)}`
+        )
+      }
+
       return this.buildUnavailableResult(error)
     }
+  }
+
+  private async searchHybridLexicalFallback(
+    query: string,
+    normalizedQuery: string,
+    queryPattern: string,
+    weightedKeywords: string[],
+    keywordSignals: SearchKeywordSignal[],
+    options: SearchHybridOptions,
+    tsConfig: string,
+    normalizeAndAnalyzeMs: number,
+    seedLookupMs: number,
+    seedLookupAttempts: number,
+    pipelineStartedAt: number,
+    fallbackReason: string
+  ): Promise<SearchExecutionResult> {
+    const fallbackSql = `
+      WITH lexical_candidates AS (
+        SELECT
+          d.id,
+          d.title,
+          LEFT(d.content, 240) AS snippet,
+          d.namespace,
+          d.contributors,
+          CASE
+            WHEN COALESCE(d.search_vector, ''::tsvector) @@ plainto_tsquery('${tsConfig}', $1)
+              THEN ts_rank_cd(COALESCE(d.search_vector, ''::tsvector), plainto_tsquery('${tsConfig}', $1), 32)
+            ELSE 0
+          END AS bm25_score,
+          CASE
+            WHEN to_tsvector('${tsConfig}', COALESCE(d.title, '')) @@ plainto_tsquery('${tsConfig}', $1)
+              THEN true
+            ELSE false
+          END AS title_match,
+          CASE
+            WHEN LOWER(COALESCE(d.title, '')) LIKE $2 THEN true
+            ELSE false
+          END AS like_title_match,
+          CASE
+            WHEN LOWER(d.content) LIKE $3 THEN true
+            ELSE false
+          END AS like_content_match
+        FROM namuwiki_documents d
+        WHERE COALESCE(d.search_vector, ''::tsvector) @@ plainto_tsquery('${tsConfig}', $1)
+           OR LOWER(COALESCE(d.title, '')) LIKE $2
+           OR LOWER(d.content) LIKE $3
+      )
+      SELECT
+        id,
+        title,
+        snippet,
+        namespace,
+        contributors,
+        bm25_score,
+        title_match,
+        like_title_match,
+        like_content_match
+      FROM lexical_candidates
+      ORDER BY
+        title_match DESC,
+        bm25_score DESC,
+        like_title_match DESC,
+        like_content_match DESC,
+        id DESC
+      LIMIT $4 OFFSET $5
+    `
+
+    const fallbackCountSql = `
+      WITH lexical_candidates AS (
+        SELECT d.id
+        FROM namuwiki_documents d
+        WHERE COALESCE(d.search_vector, ''::tsvector) @@ plainto_tsquery('${tsConfig}', $1)
+           OR LOWER(COALESCE(d.title, '')) LIKE $2
+           OR LOWER(d.content) LIKE $3
+      )
+      SELECT COUNT(*)::bigint AS total
+      FROM lexical_candidates
+    `
+
+    const explainSql = `EXPLAIN (FORMAT JSON) ${fallbackSql}`
+    const fallbackQueryStartedAt = Date.now()
+    const includeExplain = this.shouldIncludeExplain()
+
+    try {
+      const [rawRows, countRows, planRows] = await Promise.all([
+        this.prismaService.$queryRawUnsafe(
+          fallbackSql,
+          normalizedQuery,
+          queryPattern,
+          queryPattern,
+          options.limit,
+          options.offset
+        ),
+        this.prismaService.$queryRawUnsafe(
+          fallbackCountSql,
+          normalizedQuery,
+          queryPattern,
+          queryPattern
+        ),
+        includeExplain
+          ? this.prismaService.$queryRawUnsafe(
+              explainSql,
+              normalizedQuery,
+              queryPattern,
+              queryPattern,
+              options.limit,
+              options.offset
+            )
+          : Promise.resolve([])
+      ])
+      const annQueryMs = Date.now() - fallbackQueryStartedAt
+      const resultAssembleStartedAt = Date.now()
+      const rows = rawRows as LexicalFallbackRow[]
+      const total = Number(
+        ((countRows as Array<{ total: bigint }>)[0]?.total ?? BigInt(0)).toString()
+      )
+      const executionPlan = includeExplain
+        ? this.parseExecutionPlan(planRows as Array<Record<string, unknown>>)
+        : {}
+      const queryExplanation = includeExplain
+        ? `${this.buildQueryExplanation(executionPlan)} Fell back to BM25 search because ${fallbackReason}. Keywords used: ${weightedKeywords.join(', ') || 'none'}.`
+        : `Execution plan omitted because SEARCH_INCLUDE_EXPLAIN is disabled. Fell back to BM25 search because ${fallbackReason}. Keywords used: ${weightedKeywords.join(', ') || 'none'}.`
+
+      const items = rows.map((row) => {
+        const bm25Score = this.toUnitInterval(
+          Number(((row.bm25_score ?? 0) / (1 + (row.bm25_score ?? 0))).toFixed(3))
+        )
+        const lexicalBoost = row.title_match
+          ? 0.98
+          : row.like_title_match
+            ? 0.89
+            : row.like_content_match
+              ? 0.72
+              : 0
+        const score = this.toUnitInterval(
+          Number(Math.max(bm25Score, lexicalBoost).toFixed(3))
+        )
+
+        return {
+          id: Number(row.id),
+          title: row.title ?? 'Untitled Document',
+          snippet: row.snippet,
+          score,
+          category: row.namespace ?? 'Unknown',
+          distance: Number((1 - score).toFixed(4)),
+          tags: this.toTags(row.contributors),
+          matchRate: Number((score * 100).toFixed(1)),
+          usedKeywords: weightedKeywords,
+          matchedKeywords: this.findMatchedKeywords(
+            weightedKeywords,
+            `${row.title ?? ''} ${row.snippet}`
+          )
+        }
+      })
+      const resultAssembleMs = Date.now() - resultAssembleStartedAt
+
+      return {
+        items,
+        total,
+        learning: {
+          generatedSql:
+            `${fallbackSql.trim()}\n-- fallbackStrategy: bm25-only, fallbackReason: ${fallbackReason}, embeddingModel: ${options.embeddingModel}, requestedMode: ${options.mode}, bm25: ${options.bm25Enabled}, hybridRatio: ${options.hybridRatio}, rankTsQuery: ${weightedKeywords.join(' ') || 'none'}`,
+          executionPlan,
+          queryExplanation,
+          keywordSignals,
+          pipelineTimings: {
+            normalizeAndAnalyzeMs,
+            seedLookupMs,
+            annQueryMs,
+            resultAssembleMs,
+            totalPipelineMs: Date.now() - pipelineStartedAt,
+            seedLookupAttempts,
+            seedFound: false
+          }
+        }
+      }
+    } catch (error) {
+      const unavailableResult = this.buildUnavailableResult(error)
+
+      return {
+        ...unavailableResult,
+        learning: {
+          ...unavailableResult.learning,
+          generatedSql:
+            `${unavailableResult.learning.generatedSql}\n-- fallbackStrategy: bm25-only, fallbackReason: ${fallbackReason}`,
+          keywordSignals,
+          pipelineTimings: {
+            normalizeAndAnalyzeMs,
+            seedLookupMs,
+            annQueryMs: 0,
+            resultAssembleMs: 0,
+            totalPipelineMs: Date.now() - pipelineStartedAt,
+            seedLookupAttempts,
+            seedFound: false
+          }
+        }
+      }
+    }
+  }
+
+  private async hasEmbeddings(embeddingModel: EmbeddingModel): Promise<boolean> {
+    const availabilitySql =
+      embeddingModel === 'qwen3'
+        ? `
+          SELECT EXISTS(
+            SELECT 1
+            FROM namuwiki_document_embeddings_qwen
+            WHERE embedding IS NOT NULL
+          ) AS available
+        `
+        : `
+          SELECT EXISTS(
+            SELECT 1
+            FROM namuwiki_documents
+            WHERE embedding IS NOT NULL
+          ) AS available
+        `
+
+    try {
+      const rows = (await this.prismaService.$queryRawUnsafe(availabilitySql)) as Array<{
+        available: boolean
+      }>
+      return Boolean(rows[0]?.available)
+    } catch {
+      return false
+    }
+  }
+
+  private describeError(error: unknown): string {
+    if (error instanceof Error) {
+      return error.message
+    }
+
+    return typeof error === 'string' ? error : 'unknown-error'
   }
 
   private buildUnavailableResult(error?: unknown): SearchExecutionResult {
@@ -677,6 +863,10 @@ export class AppService {
           `Database query failed, so no search results were returned. Root cause: ${reason}. Check database connectivity and retry.`
       }
     }
+  }
+
+  private shouldIncludeExplain(): boolean {
+    return process.env.SEARCH_INCLUDE_EXPLAIN !== 'false'
   }
 
   private parseExecutionPlan(
@@ -731,6 +921,7 @@ export class AppService {
 
   private extractQueryTerms(normalizedQuery: string): string[] {
     return normalizedQuery
+      .replace(/[^\p{L}\p{N}\s]/gu, ' ')
       .split(/\s+/)
       .map((term) => this.normalizeKeyword(term))
       .filter((term) => term.length > 0)

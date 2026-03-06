@@ -21,6 +21,12 @@ interface HealthData {
   status: string
   service: string
   database: string
+  prewarm?: {
+    configuredModels: EmbeddingModel[]
+    readyModels: EmbeddingModel[]
+    pendingModels: EmbeddingModel[]
+    ready: boolean
+  }
 }
 
 interface ParsedSearchRequest {

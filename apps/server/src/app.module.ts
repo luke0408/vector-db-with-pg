@@ -3,6 +3,7 @@ import { LoggerModule } from 'nestjs-pino'
 import { AppController } from './app.controller'
 import { AppService } from './app.service'
 import { PrismaModule } from './prisma/prisma.module'
+import { QueryEmbeddingService } from './query-embedding.service'
 
 @Module({
   imports: [
@@ -26,6 +27,6 @@ import { PrismaModule } from './prisma/prisma.module'
     })
   ],
   controllers: [AppController],
-  providers: [AppService]
+  providers: [AppService, QueryEmbeddingService]
 })
 export class AppModule {}

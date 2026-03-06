@@ -2,9 +2,15 @@ import { Test, TestingModule } from '@nestjs/testing'
 import { AppController } from '../src/app.controller'
 import { AppService } from '../src/app.service'
 import { PrismaService } from '../src/prisma/prisma.service'
+import { QueryEmbeddingService } from '../src/query-embedding.service'
 
 const prismaServiceMock = {
   $queryRawUnsafe: jest.fn()
+}
+
+const queryEmbeddingServiceMock = {
+  embedQuery: jest.fn(),
+  getHealthStatus: jest.fn()
 }
 
 async function createTestingModule(): Promise<TestingModule> {
@@ -15,6 +21,10 @@ async function createTestingModule(): Promise<TestingModule> {
       {
         provide: PrismaService,
         useValue: prismaServiceMock
+      },
+      {
+        provide: QueryEmbeddingService,
+        useValue: queryEmbeddingServiceMock
       }
     ]
   }).compile()
@@ -22,10 +32,23 @@ async function createTestingModule(): Promise<TestingModule> {
 
 describe('AppController', () => {
   beforeEach(() => {
-    jest.clearAllMocks()
+    prismaServiceMock.$queryRawUnsafe.mockReset()
+    queryEmbeddingServiceMock.embedQuery.mockReset()
+    queryEmbeddingServiceMock.getHealthStatus.mockReset()
+    queryEmbeddingServiceMock.embedQuery.mockResolvedValue({
+      vectorLiteral: '[0.1,0.2,0.3]'
+    })
+    queryEmbeddingServiceMock.getHealthStatus.mockReturnValue({
+      configuredModels: ['qwen3'],
+      readyModels: ['qwen3'],
+      pendingModels: [],
+      ready: true
+    })
+    delete process.env.SEARCH_INCLUDE_EXPLAIN
+    delete process.env.SEARCH_INCLUDE_TOTAL_COUNT
   })
 
-  it('returns api health payload with db status', async () => {
+  it('returns api health payload with db and prewarm status', async () => {
     prismaServiceMock.$queryRawUnsafe.mockResolvedValueOnce([{ '?column?': 1 }])
 
     const moduleRef = await createTestingModule()
@@ -37,11 +60,44 @@ describe('AppController', () => {
     expect(response.data[0]).toEqual({
       status: 'ok',
       service: 'vector-search-server',
-      database: 'up'
+      database: 'up',
+      prewarm: {
+        ready: true,
+        configuredModels: ['qwen3'],
+        readyModels: ['qwen3'],
+        pendingModels: []
+      }
     })
   })
 
-  it('returns search envelope with items and learning fields', async () => {
+  it('reports warming state in health when prewarm is not ready yet', async () => {
+    prismaServiceMock.$queryRawUnsafe.mockResolvedValueOnce([{ '?column?': 1 }])
+    queryEmbeddingServiceMock.getHealthStatus.mockReturnValueOnce({
+      configuredModels: ['qwen3'],
+      readyModels: [],
+      pendingModels: ['qwen3'],
+      ready: false
+    })
+
+    const moduleRef = await createTestingModule()
+    const controller = moduleRef.get(AppController)
+    const response = await controller.health()
+
+    expect(response.success).toBe(true)
+    expect(response.error).toBeUndefined()
+    expect(response.data[0]).toEqual(
+      expect.objectContaining({
+        status: 'ok',
+        database: 'up',
+        prewarm: expect.objectContaining({
+          ready: false,
+          pendingModels: ['qwen3']
+        })
+      })
+    )
+  })
+
+  it('returns search envelope with execution plan by default', async () => {
     prismaServiceMock.$queryRawUnsafe
       .mockResolvedValueOnce([
         {
@@ -89,6 +145,29 @@ describe('AppController', () => {
     )
   })
 
+  it('omits execution plan when explain mode is explicitly disabled', async () => {
+    process.env.SEARCH_INCLUDE_EXPLAIN = 'false'
+    prismaServiceMock.$queryRawUnsafe
+      .mockResolvedValueOnce([
+        {
+          id: BigInt(1),
+          title: 'ARM (Architecture)',
+          snippet: 'ARM architecture ...',
+          namespace: 'Computing',
+          contributors: 'user-a,user-b',
+          score: 0.984
+        }
+      ])
+      .mockResolvedValueOnce([{ total: BigInt(1) }])
+
+    const moduleRef = await createTestingModule()
+    const controller = moduleRef.get(AppController)
+    const response = await controller.search({ query: 'ARM', offset: 0, limit: 10 })
+
+    expect(response.data[0].learning.executionPlan).toEqual({})
+    expect(response.data[0].learning.queryExplanation).toContain('Execution plan omitted')
+  })
+
   it('rejects invalid embedding model input for lexical search', async () => {
     const moduleRef = await createTestingModule()
     const controller = moduleRef.get(AppController)
@@ -109,13 +188,9 @@ describe('AppController', () => {
     expect(response.error).toBe('query is required')
   })
 
-  it('returns hybrid search envelope', async () => {
+  it('returns hybrid search envelope using runtime query embeddings with execution plan by default', async () => {
     prismaServiceMock.$queryRawUnsafe
-      .mockResolvedValueOnce([
-        {
-          query_vector: '[0.1,0.2,0.3]'
-        }
-      ])
+      .mockResolvedValueOnce([{ available: true }])
       .mockResolvedValueOnce([
         {
           id: BigInt(1),
@@ -133,9 +208,9 @@ describe('AppController', () => {
           'QUERY PLAN': [
             {
               Plan: {
-                'Node Type': 'Bitmap Heap Scan',
-                'Relation Name': 'namuwiki_documents',
-                'Total Cost': 24.5,
+                'Node Type': 'Limit',
+                'Relation Name': 'namuwiki_document_embeddings_qwen',
+                'Total Cost': 20,
                 'Plan Rows': 1
               }
             }
@@ -154,12 +229,16 @@ describe('AppController', () => {
       hybridRatio: 70
     })
 
+    expect(queryEmbeddingServiceMock.embedQuery).toHaveBeenCalledWith('ARM', 'base')
     expect(response.success).toBe(true)
     expect(response.data[0].items).toHaveLength(1)
+    expect(response.data[0].learning.generatedSql).toContain(
+      'queryVectorSource: runtime-query-embedding'
+    )
     expect(response.data[0].learning.generatedSql).toContain('hybridRatio: 70')
-    expect(response.data[0].learning.generatedSql).toContain("to_tsquery('korean'")
-    expect(response.data[0].learning.generatedSql).toContain('LIMIT $8 OFFSET $9')
+    expect(response.data[0].learning.generatedSql).toContain('bm25TsQueryMode: plainto_tsquery')
     expect(response.data[0].learning.generatedSql).toContain('ranking: vector+bm25-hybrid')
+    expect(response.data[0].learning.executionPlan['Node Type']).toBe('Limit')
     expect(response.data[0].learning.keywordSignals?.[0]?.keyword).toBe('arm')
     expect(response.data[0].learning.pipelineTimings).toEqual(
       expect.objectContaining({
@@ -168,7 +247,7 @@ describe('AppController', () => {
         annQueryMs: expect.any(Number),
         resultAssembleMs: expect.any(Number),
         totalPipelineMs: expect.any(Number),
-        seedLookupAttempts: expect.any(Number),
+        seedLookupAttempts: 1,
         seedFound: true
       })
     )
@@ -182,21 +261,56 @@ describe('AppController', () => {
     )
   })
 
-  it('prioritizes technical seed terms for mixed korean and english query intent', async () => {
+  it('omits hybrid execution plan when explain mode is explicitly disabled', async () => {
+    process.env.SEARCH_INCLUDE_EXPLAIN = 'false'
     prismaServiceMock.$queryRawUnsafe
+      .mockResolvedValueOnce([{ available: true }])
       .mockResolvedValueOnce([
         {
-          query_vector: '[0.2,0.1,0.4]'
+          id: BigInt(1),
+          title: 'ARM (Architecture)',
+          snippet: 'ARM architecture ...',
+          namespace: 'Computing',
+          contributors: 'user-a,user-b',
+          vector_distance: 0.05,
+          bm25_score: 0.55
         }
       ])
+      .mockResolvedValueOnce([{ total: BigInt(1) }])
+
+    const moduleRef = await createTestingModule()
+    const controller = moduleRef.get(AppController)
+    const response = await controller.searchHybrid({
+      query: 'ARM',
+      offset: 0,
+      limit: 10,
+      mode: 'hnsw',
+      bm25Enabled: true,
+      hybridRatio: 70
+    })
+
+    expect(response.success).toBe(true)
+    expect(response.data[0].learning.executionPlan).toEqual({})
+    expect(response.data[0].learning.queryExplanation).toContain('Execution plan omitted')
+  })
+
+  it('falls back to lexical BM25 when query embedding is unavailable', async () => {
+    queryEmbeddingServiceMock.embedQuery.mockResolvedValueOnce({
+      reason: 'query-embedding-unavailable'
+    })
+    prismaServiceMock.$queryRawUnsafe
+      .mockResolvedValueOnce([{ available: true }])
       .mockResolvedValueOnce([
         {
           id: BigInt(2),
-          title: 'CPU 벤치마크',
-          snippet: '최신 CPU 성능 비교 ...',
-          namespace: 'Hardware',
+          title: '김승민(래퍼)',
+          snippet: '김승민은 대한민국의 래퍼다 ...',
+          namespace: 'Music',
           contributors: 'user-c',
-          vector_distance: 0.15
+          bm25_score: 1.8,
+          title_match: true,
+          like_title_match: true,
+          like_content_match: true
         }
       ])
       .mockResolvedValueOnce([{ total: BigInt(1) }])
@@ -205,9 +319,9 @@ describe('AppController', () => {
           'QUERY PLAN': [
             {
               Plan: {
-                'Node Type': 'Limit',
+                'Node Type': 'Bitmap Heap Scan',
                 'Relation Name': 'namuwiki_documents',
-                'Total Cost': 21.9,
+                'Total Cost': 18.2,
                 'Plan Rows': 1
               }
             }
@@ -218,27 +332,30 @@ describe('AppController', () => {
     const moduleRef = await createTestingModule()
     const controller = moduleRef.get(AppController)
     const response = await controller.searchHybrid({
-      query: '가장 좋은 CPU',
+      query: '김승민(래퍼) 관점에서 핵심 개념과 배경을 알려줘',
       offset: 0,
       limit: 10,
       mode: 'hnsw',
       bm25Enabled: true,
-      hybridRatio: 50
+      hybridRatio: 53
     })
 
     expect(response.success).toBe(true)
-    expect(response.data[0].items).toHaveLength(1)
-    expect(response.data[0].items[0].title).toBe('CPU 벤치마크')
-    expect(response.data[0].items[0].usedKeywords).toContain('cpu')
-    expect(response.data[0].learning.keywordSignals?.[0]?.keyword).toBe('cpu')
-    expect(response.data[0].learning.generatedSql).toContain('technicalSeedTsQuery: cpu')
+    expect(response.data[0].items[0].title).toBe('김승민(래퍼)')
+    expect(response.data[0].items[0].usedKeywords).toContain('김승민')
+    expect(response.data[0].items[0].usedKeywords).toContain('래퍼')
+    expect(response.data[0].items[0].usedKeywords).not.toContain('김승민래퍼')
+    expect(response.data[0].learning.generatedSql).toContain('fallbackStrategy: bm25-only')
+    expect(response.data[0].learning.generatedSql).toContain(
+      'fallbackReason: query-embedding-unavailable'
+    )
+    expect(response.data[0].learning.queryExplanation).toContain('Fell back to BM25 search')
+    expect(response.data[0].learning.pipelineTimings?.seedFound).toBe(false)
   })
 
-  it('falls back to LIKE seed when korean FTS and title seed are missing', async () => {
+  it('falls back to lexical BM25 when the selected embedding store is empty', async () => {
     prismaServiceMock.$queryRawUnsafe
-      .mockResolvedValueOnce([{ query_vector: null }])
-      .mockResolvedValueOnce([{ query_vector: null }])
-      .mockResolvedValueOnce([{ query_vector: '[0.2,0.1,0.3]' }])
+      .mockResolvedValueOnce([{ available: false }])
       .mockResolvedValueOnce([
         {
           id: BigInt(7),
@@ -246,9 +363,10 @@ describe('AppController', () => {
           snippet: '인사 관련 안내 ...',
           namespace: 'Language',
           contributors: 'user-k',
-          vector_distance: 0.11,
           bm25_score: 0.72,
-          title_match_score: 1
+          title_match: true,
+          like_title_match: true,
+          like_content_match: true
         }
       ])
       .mockResolvedValueOnce([{ total: BigInt(1) }])
@@ -275,29 +393,49 @@ describe('AppController', () => {
       limit: 10,
       mode: 'ivf',
       bm25Enabled: true,
-      hybridRatio: 60
+      hybridRatio: 60,
+      embeddingModel: 'base'
     })
 
+    expect(queryEmbeddingServiceMock.embedQuery).not.toHaveBeenCalled()
     expect(response.success).toBe(true)
-    expect(response.data[0].items).toHaveLength(1)
     expect(response.data[0].items[0].title).toBe('인사 안내')
-    expect(response.data[0].learning.generatedSql).toContain("ORDER BY CASE")
-    expect(response.data[0].learning.generatedSql).toContain("to_tsquery('korean'")
+    expect(response.data[0].learning.generatedSql).toContain('fallbackStrategy: bm25-only')
+    expect(response.data[0].learning.generatedSql).toContain(
+      'fallbackReason: embedding-store-empty:base'
+    )
   })
 
-  it('applies short-query strategy for ambiguous korean terms in hnsw mode', async () => {
+  it('falls back to lexical BM25 when ANN returns no candidates', async () => {
     prismaServiceMock.$queryRawUnsafe
-      .mockResolvedValueOnce([{ query_vector: '[0.1,0.3,0.2]' }])
+      .mockResolvedValueOnce([{ available: true }])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ total: BigInt(0) }])
       .mockResolvedValueOnce([
         {
-          id: BigInt(21),
-          title: '인사청문회/조국',
-          snippet: '인사청문회 ...',
+          'QUERY PLAN': [
+            {
+              Plan: {
+                'Node Type': 'Limit',
+                'Relation Name': 'namuwiki_document_embeddings_qwen',
+                'Total Cost': 20,
+                'Plan Rows': 0
+              }
+            }
+          ]
+        }
+      ])
+      .mockResolvedValueOnce([
+        {
+          id: BigInt(31),
+          title: '인사청문회',
+          snippet: '인사청문회 관련 설명 ...',
           namespace: 'Politics',
-          contributors: 'user-q',
-          vector_distance: 0.42,
-          bm25_score: 0.1667,
-          title_match_score: 1
+          contributors: 'user-x',
+          bm25_score: 0.8,
+          title_match: true,
+          like_title_match: true,
+          like_content_match: true
         }
       ])
       .mockResolvedValueOnce([{ total: BigInt(1) }])
@@ -306,9 +444,9 @@ describe('AppController', () => {
           'QUERY PLAN': [
             {
               Plan: {
-                'Node Type': 'Index Scan',
+                'Node Type': 'Bitmap Heap Scan',
                 'Relation Name': 'namuwiki_documents',
-                'Total Cost': 31.7,
+                'Total Cost': 18,
                 'Plan Rows': 1
               }
             }
@@ -324,18 +462,24 @@ describe('AppController', () => {
       limit: 10,
       mode: 'hnsw',
       bm25Enabled: true,
-      hybridRatio: 50
+      hybridRatio: 53,
+      embeddingModel: 'qwen3'
     })
 
     expect(response.success).toBe(true)
-    expect(response.data[0].items).toHaveLength(1)
-    expect(response.data[0].items[0].title).toBe('인사청문회/조국')
-    expect(response.data[0].learning.generatedSql).toContain('shortQueryStrategy: seed-priority')
+    expect(response.data[0].items[0].title).toBe('인사청문회')
+    expect(response.data[0].learning.generatedSql).toContain('fallbackStrategy: bm25-only')
+    expect(response.data[0].learning.generatedSql).toContain(
+      'fallbackReason: ann-candidates-empty'
+    )
   })
 
-  it('keeps hybrid matchRate bounded when bm25 is disabled', async () => {
+  it('falls back to lexical LIKE search when bm25 is disabled and query embeddings are unavailable', async () => {
+    queryEmbeddingServiceMock.embedQuery.mockResolvedValueOnce({
+      reason: 'query-embedding-timeout'
+    })
     prismaServiceMock.$queryRawUnsafe
-      .mockResolvedValueOnce([{ query_vector: '[0.1,0.2,0.3]' }])
+      .mockResolvedValueOnce([{ available: true }])
       .mockResolvedValueOnce([
         {
           id: BigInt(12),
@@ -343,7 +487,7 @@ describe('AppController', () => {
           snippet: '포켓몬 문서 ...',
           namespace: 'Game',
           contributors: 'user-p',
-          vector_distance: 0
+          score: 0.984
         }
       ])
       .mockResolvedValueOnce([{ total: BigInt(1) }])
@@ -374,168 +518,16 @@ describe('AppController', () => {
     })
 
     expect(response.success).toBe(true)
-    expect(response.data[0].items).toHaveLength(1)
-    expect(response.data[0].items[0].matchRate).toBe(100)
-    expect(response.data[0].items[0].score).toBe(1)
-  })
-
-  it('keeps lexical gate enabled for non-long intent query and preserves rank tsquery terms', async () => {
-    prismaServiceMock.$queryRawUnsafe
-      .mockResolvedValueOnce([{ query_vector: '[0.3,0.1,0.2]' }])
-      .mockResolvedValueOnce([
-        {
-          id: BigInt(44),
-          title: '포켓몬 최강 랭킹',
-          snippet: '가장 강한 포켓몬 ...',
-          namespace: 'Game',
-          contributors: 'user-p',
-          vector_distance: 0.2,
-          bm25_score: 0.8,
-          title_match_score: 1,
-          used_keywords: ['포켓몬', '가장', '강한'],
-          matched_keywords: ['포켓몬', '강한']
-        }
-      ])
-      .mockResolvedValueOnce([{ total: BigInt(1) }])
-      .mockResolvedValueOnce([
-        {
-          'QUERY PLAN': [
-            {
-              Plan: {
-                'Node Type': 'Limit',
-                'Relation Name': 'namuwiki_documents',
-                'Total Cost': 40.5,
-                'Plan Rows': 10
-              }
-            }
-          ]
-        }
-      ])
-
-    const moduleRef = await createTestingModule()
-    const controller = moduleRef.get(AppController)
-    const response = await controller.searchHybrid({
-      query: '가장 강한 포켓몬',
-      offset: 0,
-      limit: 10,
-      mode: 'hnsw',
-      bm25Enabled: true,
-      hybridRatio: 53
-    })
-
-    expect(response.success).toBe(true)
-    expect(response.data[0].items).toHaveLength(1)
-    expect(response.data[0].items[0].title).toBe('포켓몬 최강 랭킹')
-    expect(response.data[0].learning.generatedSql).toContain('ranking: vector+bm25-hybrid')
-    expect(response.data[0].learning.generatedSql).toContain('rankTsQuery:')
-    expect(response.data[0].learning.generatedSql).toContain('포켓몬')
-    expect(response.data[0].learning.generatedSql).toContain('강한')
-  })
-
-  it('keeps lexical gate on for long query when domain anchor keyword exists', async () => {
-    prismaServiceMock.$queryRawUnsafe
-      .mockResolvedValueOnce([{ query_vector: '[0.1,0.2,0.3]' }])
-      .mockResolvedValueOnce([
-        {
-          id: BigInt(55),
-          title: '포켓몬 대전 메타',
-          snippet: '포켓몬 대전에서 강한 조합 ...',
-          namespace: 'Game',
-          contributors: 'user-r',
-          vector_distance: 0.2,
-          bm25_score: 0.9,
-          title_match_score: 1,
-          used_keywords: ['포켓몬', '대전', '강한'],
-          matched_keywords: ['포켓몬', '대전']
-        }
-      ])
-      .mockResolvedValueOnce([{ total: BigInt(1) }])
-      .mockResolvedValueOnce([
-        {
-          'QUERY PLAN': [
-            {
-              Plan: {
-                'Node Type': 'Limit',
-                'Relation Name': 'namuwiki_documents',
-                'Total Cost': 42.1,
-                'Plan Rows': 10
-              }
-            }
-          ]
-        }
-      ])
-
-    const moduleRef = await createTestingModule()
-    const controller = moduleRef.get(AppController)
-    const response = await controller.searchHybrid({
-      query: '대전 환경에서 가장 강한 포켓몬 조합과 카운터 전략을 자세히 알려줘',
-      offset: 0,
-      limit: 10,
-      mode: 'hnsw',
-      bm25Enabled: true,
-      hybridRatio: 53
-    })
-
-    expect(response.success).toBe(true)
-    expect(response.data[0].items).toHaveLength(1)
-    expect(response.data[0].learning.generatedSql).toContain('domainAnchor: on')
-    expect(response.data[0].learning.generatedSql).toContain('ranking: vector+bm25-hybrid')
-  })
-
-  it('normalizes Korean particles in long non-domain queries for keyword tracing', async () => {
-    prismaServiceMock.$queryRawUnsafe
-      .mockResolvedValueOnce([{ query_vector: '[0.2,0.3,0.1]' }])
-      .mockResolvedValueOnce([
-        {
-          id: BigInt(77),
-          title: '무한도전을 빛낸 100개의 장면들',
-          snippet: '무한도전에서 화제가 된 장면 ...',
-          namespace: 'Entertainment',
-          contributors: 'user-z',
-          vector_distance: 0.18,
-          bm25_score: 0.95,
-          title_match_score: 1,
-          matched_keywords: ['100명', '빛낸']
-        }
-      ])
-      .mockResolvedValueOnce([{ total: BigInt(1) }])
-      .mockResolvedValueOnce([
-        {
-          'QUERY PLAN': [
-            {
-              Plan: {
-                'Node Type': 'Limit',
-                'Relation Name': 'namuwiki_documents',
-                'Total Cost': 53.2,
-                'Plan Rows': 10
-              }
-            }
-          ]
-        }
-      ])
-
-    const moduleRef = await createTestingModule()
-    const controller = moduleRef.get(AppController)
-    const response = await controller.searchHybrid({
-      query: '대한민국을 빛낸 100명의 위인들',
-      offset: 0,
-      limit: 10,
-      mode: 'hnsw',
-      bm25Enabled: true,
-      hybridRatio: 53
-    })
-
-    expect(response.success).toBe(true)
-    expect(response.data[0].items).toHaveLength(1)
-    expect(response.data[0].items[0].usedKeywords).toContain('대한민국')
-    expect(response.data[0].items[0].usedKeywords).not.toContain('대한민국을')
-    expect(response.data[0].learning.generatedSql).toContain('domainAnchor: off')
-    expect(response.data[0].learning.generatedSql).toContain('ranking: vector+bm25-hybrid')
+    expect(response.data[0].items[0].title).toBe('포켓몬')
+    expect(response.data[0].learning.generatedSql).toContain('fallback: lexical-like')
+    expect(response.data[0].learning.generatedSql).toContain(
+      'reason: query-embedding-timeout'
+    )
   })
 
   it('returns selected embedding model in meta for hybrid search', async () => {
     prismaServiceMock.$queryRawUnsafe
-      .mockResolvedValueOnce([{ query_vector: '[0.2,0.3,0.1]' }])
+      .mockResolvedValueOnce([{ available: true }])
       .mockResolvedValueOnce([
         {
           id: BigInt(88),
