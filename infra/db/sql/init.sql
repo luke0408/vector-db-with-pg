@@ -35,3 +35,18 @@ CREATE INDEX IF NOT EXISTS idx_namuwiki_documents_embedding_hnsw_cosine
 
 CREATE INDEX IF NOT EXISTS idx_namuwiki_documents_embedding_ivfflat_ip
     ON namuwiki_documents USING ivfflat (embedding vector_ip_ops) WITH (lists = 200);
+
+CREATE TABLE IF NOT EXISTS namuwiki_document_embeddings_qwen (
+    doc_hash TEXT PRIMARY KEY REFERENCES namuwiki_documents(doc_hash) ON DELETE CASCADE,
+    embedding VECTOR(1024) NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE namuwiki_document_embeddings_qwen
+    ALTER COLUMN embedding TYPE VECTOR(1024);
+
+CREATE INDEX IF NOT EXISTS idx_namuwiki_document_embeddings_qwen_hnsw_cosine
+    ON namuwiki_document_embeddings_qwen USING hnsw (embedding vector_cosine_ops);
+
+CREATE INDEX IF NOT EXISTS idx_namuwiki_document_embeddings_qwen_ivfflat_ip
+    ON namuwiki_document_embeddings_qwen USING ivfflat (embedding vector_ip_ops) WITH (lists = 200);

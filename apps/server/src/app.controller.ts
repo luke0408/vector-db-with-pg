@@ -11,6 +11,7 @@ import {
 } from './app.service'
 import {
   ApiResponse,
+  EmbeddingModel,
   SearchHybridRequest,
   SearchMode,
   SearchRequest
@@ -26,12 +27,14 @@ interface ParsedSearchRequest {
   query: string
   offset: number
   limit: number
+  embeddingModel: EmbeddingModel
 }
 
 interface ParsedSearchHybridRequest extends ParsedSearchRequest {
   mode: SearchMode
   bm25Enabled: boolean
   hybridRatio: number
+  embeddingModel: EmbeddingModel
 }
 
 interface SearchResultData {
@@ -100,7 +103,8 @@ export class AppController {
     try {
       const options: SearchQueryOptions = {
         offset: request.offset,
-        limit: request.limit
+        limit: request.limit,
+        embeddingModel: request.embeddingModel
       }
       const results = await this.appService.search(request.query, options)
       const tookMs = Date.now() - startedAt
@@ -117,7 +121,8 @@ export class AppController {
           total: results.total,
           offset: options.offset,
           limit: options.limit,
-          tookMs
+          tookMs,
+          embeddingModelUsed: options.embeddingModel
         }
       }
     } catch {
@@ -129,7 +134,8 @@ export class AppController {
           total: 0,
           offset: request.offset,
           limit: request.limit,
-          tookMs: Date.now() - startedAt
+          tookMs: Date.now() - startedAt,
+          embeddingModelUsed: request.embeddingModel
         }
       }
     }
@@ -158,7 +164,8 @@ export class AppController {
         limit: request.limit,
         mode: request.mode,
         bm25Enabled: request.bm25Enabled,
-        hybridRatio: request.hybridRatio
+        hybridRatio: request.hybridRatio,
+        embeddingModel: request.embeddingModel
       }
 
       const results = await this.appService.searchHybrid(request.query, options)
@@ -176,7 +183,8 @@ export class AppController {
           total: results.total,
           offset: options.offset,
           limit: options.limit,
-          tookMs
+          tookMs,
+          embeddingModelUsed: options.embeddingModel
         }
       }
     } catch {
@@ -188,7 +196,8 @@ export class AppController {
           total: 0,
           offset: request.offset,
           limit: request.limit,
-          tookMs: Date.now() - startedAt
+          tookMs: Date.now() - startedAt,
+          embeddingModelUsed: request.embeddingModel
         }
       }
     }
@@ -204,7 +213,8 @@ export class AppController {
         value: {
           query: '',
           offset: 0,
-          limit: 20
+          limit: 20,
+          embeddingModel: 'base'
         },
         error: 'query must be provided as string'
       }
@@ -217,7 +227,8 @@ export class AppController {
         value: {
           query: '',
           offset: 0,
-          limit: 20
+          limit: 20,
+          embeddingModel: 'base'
         },
         error: 'query is required'
       }
@@ -228,7 +239,8 @@ export class AppController {
         value: {
           query: '',
           offset: 0,
-          limit: 20
+          limit: 20,
+          embeddingModel: 'base'
         },
         error: 'query length must be 200 or fewer'
       }
@@ -236,13 +248,27 @@ export class AppController {
 
     const offset = this.toIntOrDefault(rawRequest.offset, 0)
     const limit = this.toIntOrDefault(rawRequest.limit, 20)
+    const embeddingModel = rawRequest.embeddingModel ?? 'base'
+
+    if (embeddingModel !== 'base' && embeddingModel !== 'qwen3') {
+      return {
+        value: {
+          query: normalizedQuery,
+          offset,
+          limit,
+          embeddingModel: 'base'
+        },
+        error: 'embeddingModel must be one of base, qwen3'
+      }
+    }
 
     if (offset < 0) {
       return {
         value: {
           query: normalizedQuery,
           offset: 0,
-          limit: 20
+          limit: 20,
+          embeddingModel
         },
         error: 'offset must be 0 or greater'
       }
@@ -253,7 +279,8 @@ export class AppController {
         value: {
           query: normalizedQuery,
           offset,
-          limit: 20
+          limit: 20,
+          embeddingModel
         },
         error: 'limit must be between 1 and 100'
       }
@@ -263,7 +290,8 @@ export class AppController {
       value: {
         query: normalizedQuery,
         offset,
-        limit
+        limit,
+        embeddingModel
       }
     }
   }
@@ -284,7 +312,8 @@ export class AppController {
           limit: 20,
           mode: 'none',
           bm25Enabled: true,
-          hybridRatio: 50
+          hybridRatio: 50,
+          embeddingModel: 'base'
         },
         error: parsedSearch.error
       }
@@ -297,6 +326,7 @@ export class AppController {
       rawRequest?.hybridRatio,
       50
     )
+    const embeddingModel = rawRequest?.embeddingModel ?? 'base'
 
     if (!this.isSearchMode(mode)) {
       return {
@@ -304,9 +334,23 @@ export class AppController {
           ...parsedSearch.value,
           mode: 'none',
           bm25Enabled,
-          hybridRatio
+          hybridRatio,
+          embeddingModel
         },
         error: 'mode must be one of none, hnsw, ivf'
+      }
+    }
+
+    if (embeddingModel !== 'base' && embeddingModel !== 'qwen3') {
+      return {
+        value: {
+          ...parsedSearch.value,
+          mode,
+          bm25Enabled,
+          hybridRatio,
+          embeddingModel: 'base'
+        },
+        error: 'embeddingModel must be one of base, qwen3'
       }
     }
 
@@ -316,7 +360,8 @@ export class AppController {
           ...parsedSearch.value,
           mode,
           bm25Enabled,
-          hybridRatio: 50
+          hybridRatio: 50,
+          embeddingModel: 'base'
         },
         error: 'hybridRatio must be between 0 and 100'
       }
@@ -327,7 +372,8 @@ export class AppController {
         ...parsedSearch.value,
         mode,
         bm25Enabled,
-        hybridRatio
+        hybridRatio,
+        embeddingModel
       }
     }
   }
@@ -342,7 +388,10 @@ export class AppController {
     return {
       query: typeof raw.query === 'string' ? raw.query : undefined,
       offset: this.pickOptionalNumber(raw, 'offset'),
-      limit: this.pickOptionalNumber(raw, 'limit')
+      limit: this.pickOptionalNumber(raw, 'limit'),
+      embeddingModel: this.pickOptionalString(raw, 'embeddingModel') as
+        | EmbeddingModel
+        | undefined
     }
   }
 
@@ -359,7 +408,10 @@ export class AppController {
       ...this.toSearchRequestCandidate(value),
       mode: this.pickOptionalString(raw, 'mode') as SearchMode | undefined,
       bm25Enabled: this.pickOptionalBoolean(raw, 'bm25Enabled'),
-      hybridRatio: this.pickOptionalNumber(raw, 'hybridRatio')
+      hybridRatio: this.pickOptionalNumber(raw, 'hybridRatio'),
+      embeddingModel: this.pickOptionalString(raw, 'embeddingModel') as
+        | EmbeddingModel
+        | undefined
     }
   }
 

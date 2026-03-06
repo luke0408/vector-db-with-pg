@@ -79,6 +79,7 @@ describe('AppController', () => {
     expect(response.data[0].items).toHaveLength(1)
     expect(response.data[0].learning.generatedSql).toContain('SELECT')
     expect(response.data[0].learning.executionPlan['Node Type']).toBe('Index Scan')
+    expect(response.meta?.embeddingModelUsed).toBe('base')
     expect(response.meta).toEqual(
       expect.objectContaining({
         total: 1,
@@ -86,6 +87,16 @@ describe('AppController', () => {
         limit: 10
       })
     )
+  })
+
+  it('rejects invalid embedding model input for lexical search', async () => {
+    const moduleRef = await createTestingModule()
+    const controller = moduleRef.get(AppController)
+    const response = await controller.search({ query: 'arm', embeddingModel: 'bad-model' })
+
+    expect(response.success).toBe(false)
+    expect(response.data).toEqual([])
+    expect(response.error).toBe('embeddingModel must be one of base, qwen3')
   })
 
   it('returns validation error envelope for empty query', async () => {
@@ -520,5 +531,64 @@ describe('AppController', () => {
     expect(response.data[0].items[0].usedKeywords).not.toContain('대한민국을')
     expect(response.data[0].learning.generatedSql).toContain('domainAnchor: off')
     expect(response.data[0].learning.generatedSql).toContain('ranking: vector+bm25-hybrid')
+  })
+
+  it('returns selected embedding model in meta for hybrid search', async () => {
+    prismaServiceMock.$queryRawUnsafe
+      .mockResolvedValueOnce([{ query_vector: '[0.2,0.3,0.1]' }])
+      .mockResolvedValueOnce([
+        {
+          id: BigInt(88),
+          title: 'QWEN 테스트',
+          snippet: 'qwen embedding test ...',
+          namespace: 'Test',
+          contributors: 'user-t',
+          vector_distance: 0.2,
+          bm25_score: 0.7
+        }
+      ])
+      .mockResolvedValueOnce([{ total: BigInt(1) }])
+      .mockResolvedValueOnce([
+        {
+          'QUERY PLAN': [
+            {
+              Plan: {
+                'Node Type': 'Limit',
+                'Relation Name': 'namuwiki_documents',
+                'Total Cost': 10,
+                'Plan Rows': 1
+              }
+            }
+          ]
+        }
+      ])
+
+    const moduleRef = await createTestingModule()
+    const controller = moduleRef.get(AppController)
+    const response = await controller.searchHybrid({
+      query: 'qwen',
+      offset: 0,
+      limit: 10,
+      mode: 'hnsw',
+      bm25Enabled: true,
+      hybridRatio: 50,
+      embeddingModel: 'qwen3'
+    })
+
+    expect(response.success).toBe(true)
+    expect(response.meta?.embeddingModelUsed).toBe('qwen3')
+    expect(response.data[0].learning.generatedSql).toContain('embeddingModel: qwen3')
+  })
+
+  it('rejects invalid embedding model input', async () => {
+    const moduleRef = await createTestingModule()
+    const controller = moduleRef.get(AppController)
+    const response = await controller.searchHybrid({
+      query: 'arm',
+      embeddingModel: 'bad-model'
+    })
+
+    expect(response.success).toBe(false)
+    expect(response.error).toBe('embeddingModel must be one of base, qwen3')
   })
 })

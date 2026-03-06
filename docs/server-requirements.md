@@ -3,7 +3,7 @@
 ## 1) Objective
 
 - Build a NestJS service for pgvector learning, search experimentation, and benchmark preparation on top of PostgreSQL + pgvector.
-- Reuse `namuwiki_documents` schema from `sql/init.sql`.
+- Reuse `namuwiki_documents` schema from `infra/db/sql/init.sql`.
 - Keep docker-compose as the primary local runtime.
 - In v1, prioritize learning visibility features from web UI: `Generated SQL`, `Query Execution Plan`, and `Query Explanation`.
 
@@ -71,6 +71,7 @@ interface ApiResponse<T> {
     limit: number
     tookMs?: number
     requestId?: string
+    embeddingModelUsed?: 'base' | 'qwen3' // hybrid endpoint only
   }
 }
 ```
@@ -138,6 +139,7 @@ interface SearchHybridRequestV15 {
   mode?: 'none' | 'hnsw' | 'ivf'
   bm25Enabled?: boolean
   hybridRatio?: number // 0..100
+  embeddingModel?: 'base' | 'qwen3' // default: 'base'
 }
 ```
 
@@ -145,8 +147,10 @@ Response follows same envelope and learning fields policy as `POST /api/search`.
 
 ## 5) Data and Index Requirements
 
-- Preserve compatibility with `VECTOR(384)` embedding shape.
-- Validate embedding dimension at API boundary before DB execution.
+- Preserve compatibility with dual embedding shapes:
+  - `base` => `namuwiki_documents.embedding` (`VECTOR(384)`)
+  - `qwen3` => `namuwiki_document_embeddings_qwen.embedding` (`VECTOR(1024)`)
+- Validate request `embeddingModel` enum at API boundary before DB execution.
 - Keep text search config fallback (`korean` -> `simple`) aligned with DB init.
 - In v1, index strategy APIs are deferred, but query plan output must expose whether index scan or sequential scan is used for learning.
 
@@ -193,10 +197,11 @@ Response follows same envelope and learning fields policy as `POST /api/search`.
   - query explanation
 - `AC-4` (v1): `data` field is always an array and offset pagination works.
 - `AC-5` (v1.5): `/api/search/hybrid` supports mode/BM25/hybrid ratio.
+- `AC-6` (v1.5): `/api/search/hybrid` supports `embeddingModel` (`base`/`qwen3`) and returns `meta.embeddingModelUsed`.
 
 ## 11) Current Code Baseline Notes
 
-- Current endpoints in code: `POST /api/search`, `GET /health` (must migrate to `/api/health`).
+- Current endpoints in code: `POST /api/search`, `GET /api/health`, `POST /api/search/hybrid`.
 - Current web API client contract: `{ query }` request, `{ success, data?, error? }` response.
 - Current web UI contains visible learning panels (`Generated SQL`, `Query Execution Plan`, `Scoring Breakdown`) and expects to surface explainability artifacts.
 
@@ -218,9 +223,11 @@ Response follows same envelope and learning fields policy as `POST /api/search`.
 
 ### Phase 1.5 - Hybrid Controls (SHOULD)
 
-- [ ] Implement `POST /api/search/hybrid`.
-- [ ] Wire mode/BM25/hybrid ratio request options.
-- [ ] Validate hybrid ratio bounds and fallback behavior.
+- [x] Implement `POST /api/search/hybrid`.
+- [x] Wire mode/BM25/hybrid ratio request options.
+- [x] Validate hybrid ratio bounds and fallback behavior.
+- [x] Add `embeddingModel` request option (`base`/`qwen3`, default `base`).
+- [x] Return `meta.embeddingModelUsed` in hybrid search response.
 
 ### Phase 2 - Benchmark/Index/Experiment (LATER)
 

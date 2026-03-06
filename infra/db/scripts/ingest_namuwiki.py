@@ -6,14 +6,15 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
-INIT_SQL_PATH = ROOT_DIR / "sql" / "init.sql"
+DB_ROOT_DIR = Path(__file__).resolve().parents[1]
+PROJECT_ROOT_DIR = Path(__file__).resolve().parents[3]
+INIT_SQL_PATH = DB_ROOT_DIR / "sql" / "init.sql"
 
 DEFAULT_HF_PARQUET_URL = (
     "https://huggingface.co/datasets/heegyu/namuwiki/resolve/main/"
     "namuwiki_20210301.parquet"
 )
-DEFAULT_LOCAL_PARQUET_PATH = ROOT_DIR / "data" / "namuwiki_20210301.parquet"
+DEFAULT_LOCAL_PARQUET_PATH = DB_ROOT_DIR / "data" / "namuwiki_20210301.parquet"
 DEFAULT_EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 
@@ -128,6 +129,9 @@ def parquet_rows(
             rows.get("contributors", []),
             rows.get("namespace", []),
         ):
+            if max_rows is not None and total >= max_rows:
+                return
+
             yield (
                 str(title) if title is not None else None,
                 str(text) if text is not None else None,
@@ -135,8 +139,6 @@ def parquet_rows(
                 str(namespace) if namespace is not None else None,
             )
             total += 1
-            if max_rows is not None and total >= max_rows:
-                return
 
 
 def upsert_batch(
@@ -195,11 +197,14 @@ def upsert_batch(
 
 
 def main() -> None:
-    load_dotenv(ROOT_DIR / ".env")
+    load_dotenv(DB_ROOT_DIR / ".env")
+    load_dotenv(PROJECT_ROOT_DIR / ".env")
     pq_module, psycopg, sentence_transformers = load_dependencies()
 
     parquet_url = os.getenv("HF_PARQUET_URL", DEFAULT_HF_PARQUET_URL)
-    parquet_path = Path(os.getenv("LOCAL_PARQUET_PATH", str(DEFAULT_LOCAL_PARQUET_PATH)))
+    parquet_path = Path(
+        os.getenv("LOCAL_PARQUET_PATH", str(DEFAULT_LOCAL_PARQUET_PATH))
+    )
     embed_model_name = os.getenv("EMBED_MODEL", DEFAULT_EMBED_MODEL)
     batch_size = env_int("BATCH_SIZE", 128)
     parquet_batch_rows = env_int("PARQUET_BATCH_ROWS", 2048)
@@ -211,9 +216,6 @@ def main() -> None:
     local_parquet = ensure_parquet_file(parquet_url, parquet_path)
     db_params = get_db_params()
 
-    print("Loading embedding model ...")
-    embedder = sentence_transformers.SentenceTransformer(embed_model_name)
-
     inserted_or_updated = 0
     vector_dim: Optional[int] = None
 
@@ -222,6 +224,9 @@ def main() -> None:
         run_init_sql(conn)
         ts_config = resolve_ts_config(conn, ts_config_requested)
         print(f"Using text search config: {ts_config}")
+
+        print("Loading embedding model ...")
+        embedder = sentence_transformers.SentenceTransformer(embed_model_name)
 
         docs_buffer: List[Tuple[Optional[str], str, Optional[str], Optional[str]]] = []
         for title, text, contributors, namespace in parquet_rows(
@@ -249,7 +254,12 @@ def main() -> None:
             rows_for_db: List[
                 Tuple[str, Optional[str], str, Optional[str], Optional[str], str]
             ] = []
-            for (doc_title, doc_content, doc_contributors, doc_namespace), vector in zip(
+            for (
+                doc_title,
+                doc_content,
+                doc_contributors,
+                doc_namespace,
+            ), vector in zip(
                 docs_buffer,
                 vectors,
             ):
@@ -291,7 +301,12 @@ def main() -> None:
             )
 
             rows_for_db = []
-            for (doc_title, doc_content, doc_contributors, doc_namespace), vector in zip(
+            for (
+                doc_title,
+                doc_content,
+                doc_contributors,
+                doc_namespace,
+            ), vector in zip(
                 docs_buffer,
                 vectors,
             ):

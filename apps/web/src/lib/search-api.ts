@@ -43,6 +43,7 @@ export interface SearchMeta {
   limit: number
   tookMs?: number
   requestId?: string
+  embeddingModelUsed?: 'base' | 'qwen3'
 }
 
 export interface SearchResponse {
@@ -59,6 +60,7 @@ export interface SearchRequestOptions {
   mode?: 'none' | 'hnsw' | 'ivf'
   bm25Enabled?: boolean
   hybridRatio?: number
+  embeddingModel?: 'base' | 'qwen3'
 }
 
 const SERVER_BASE_URL = import.meta.env.VITE_SERVER_URL ?? 'http://localhost:3000'
@@ -73,7 +75,8 @@ export async function searchDocuments(
     limit: options.limit ?? 20,
     mode: options.mode ?? 'none',
     bm25Enabled: options.bm25Enabled ?? true,
-    hybridRatio: options.hybridRatio ?? 50
+    hybridRatio: options.hybridRatio ?? 50,
+    embeddingModel: options.embeddingModel ?? 'base'
   }
 
   const endpoint = options.useHybrid ? '/api/search/hybrid' : '/api/search'

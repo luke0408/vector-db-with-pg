@@ -8,6 +8,7 @@ import {
 import { formatSnippet } from './lib/snippet-format'
 
 type SearchMode = 'none' | 'hnsw' | 'ivf'
+type EmbeddingModel = 'base' | 'qwen3'
 
 const emptyLearning: SearchLearningData = {
   generatedSql: '-- run search to generate SQL',
@@ -20,6 +21,7 @@ export function App() {
   const [searchMode, setSearchMode] = useState<SearchMode>('none')
   const [bm25Enabled, setBm25Enabled] = useState(true)
   const [hybridRatio, setHybridRatio] = useState(50)
+  const [embeddingModel, setEmbeddingModel] = useState<EmbeddingModel>('base')
   const [showSql, setShowSql] = useState(true)
   const [showPlan, setShowPlan] = useState(false)
   const [showExplanation, setShowExplanation] = useState(true)
@@ -69,7 +71,8 @@ export function App() {
       useHybrid,
       mode: searchMode,
       bm25Enabled,
-      hybridRatio
+      hybridRatio,
+      embeddingModel
     })
 
     if (!response.success) {
@@ -169,6 +172,22 @@ export function App() {
                     onClick={() => setSearchMode(mode)}
                   >
                     {mode === 'none' ? 'None' : mode.toUpperCase()}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="config-block">
+              <p className="block-label">Embedding Model</p>
+              <div className="mode-switch">
+                {(['base', 'qwen3'] as const).map((model) => (
+                  <button
+                    key={model}
+                    type="button"
+                    className={embeddingModel === model ? 'mode active' : 'mode'}
+                    onClick={() => setEmbeddingModel(model)}
+                  >
+                    {model === 'base' ? 'BASE (384)' : 'QWEN3 (1024)'}
                   </button>
                 ))}
               </div>
@@ -321,7 +340,7 @@ export function App() {
           <div className="right-column">
             <div className="results-head">
               <h2>Search Results (Offset {offset})</h2>
-              <span>Sort by: Hybrid Relevance</span>
+              <span>Sort by: Hybrid Relevance · Model: {meta?.embeddingModelUsed ?? embeddingModel}</span>
             </div>
 
             <div className="results-list">

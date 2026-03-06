@@ -69,7 +69,29 @@ describe('App', () => {
         limit: 10,
         mode: 'none',
         bm25Enabled: true,
-        hybridRatio: 50
+        hybridRatio: 50,
+        embeddingModel: 'base'
+      })
+    )
+  })
+
+  it('sends selected embedding model when toggled', async () => {
+    render(<App />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'QWEN3 (1024)' }))
+
+    const input = screen.getByPlaceholderText('Search across NamuWiki articles...')
+    fireEvent.change(input, { target: { value: 'vector db' } })
+    fireEvent.keyDown(input, { key: 'Enter', code: 'Enter', charCode: 13 })
+
+    await waitFor(() => {
+      expect(mockedSearchDocuments).toHaveBeenCalledTimes(1)
+    })
+
+    expect(mockedSearchDocuments).toHaveBeenCalledWith(
+      'vector db',
+      expect.objectContaining({
+        embeddingModel: 'qwen3'
       })
     )
   })

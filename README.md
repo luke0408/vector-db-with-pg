@@ -63,19 +63,25 @@ docker compose up -d --build
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r infra/db/requirements.txt
 ```
 
 3. 확장/테이블 초기화 (`vector`, `textsearch_ko` 포함)
 
 ```bash
-docker exec -i pgvector psql -U "$POSTGRES_USER" -d "${POSTGRES_DB:-$POSTGRES_USER}" < sql/init.sql
+docker exec -i pgvector psql -U "$POSTGRES_USER" -d "${POSTGRES_DB:-$POSTGRES_USER}" < infra/db/sql/init.sql
 ```
 
 4. 적재 + 임베딩 실행
 
 ```bash
-python scripts/ingest_namuwiki.py
+python infra/db/scripts/ingest_namuwiki.py
+```
+
+Qwen3-VL-Embedding-8B 임베딩 실행:
+
+```bash
+python infra/db/scripts/ingest_namuwiki_qwen.py
 ```
 
 선택 환경 변수:
@@ -84,12 +90,39 @@ python scripts/ingest_namuwiki.py
 HF_PARQUET_URL=https://huggingface.co/datasets/heegyu/namuwiki/resolve/main/namuwiki_20210301.parquet
 LOCAL_PARQUET_PATH=./data/namuwiki_20210301.parquet
 EMBED_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+QWEN_EMBED_MODEL=Qwen/Qwen3-VL-Embedding-8B
+QWEN_EMBED_DIM=1024
+QWEN_BATCH_SIZE=2
+QWEN_MIN_BATCH_SIZE=1
+QWEN_MAX_TOKENS=2048
+QWEN_MIN_TOKENS=256
+QWEN_DEVICE=cuda
+QWEN_DTYPE=auto
+QWEN_LOW_CPU_MEM_USAGE=true
+QWEN_CLEAR_CACHE_EVERY_BATCH=false
+QWEN_MPS_MEMORY_FRACTION=
+QWEN_DEVICE_MAP=
+SKIP_INIT_SQL=false
 TS_CONFIG=korean
-BATCH_SIZE=128
-PARQUET_BATCH_ROWS=2048
+PARQUET_BATCH_ROWS=256
 DB_COMMIT_ROWS=512
 MAX_ROWS=1000
 MAX_TEXT_CHARS=4000
+```
+
+메모리 이슈가 있으면 아래 값을 먼저 조정하세요.
+
+- `QWEN_BATCH_SIZE`: 임베딩 **마이크로배치** 크기입니다. OOM/Killed가 발생하면 `1~2`로 낮추세요.
+- `DB_COMMIT_ROWS`: DB upsert 묶음 크기(플러시 단위)입니다. 전체 처리 범위를 제한하지 않습니다.
+- 전체 범위 임베딩은 `MAX_ROWS`를 비우거나 미설정하면 됩니다.
+- 메모리가 부족하면 `QWEN_BATCH_SIZE=1`, `QWEN_MAX_TOKENS=1024` 또는 `768`으로 낮추세요.
+- Apple Silicon(`QWEN_DEVICE=mps`)에서는 `QWEN_CLEAR_CACHE_EVERY_BATCH=true`를 권장합니다.
+- 임베딩에 NaN/Inf가 발생하면 ingest 스크립트가 해당 값을 `0`으로 치환해 pgvector 삽입 오류를 방지합니다.
+
+두 임베딩 결과 비교:
+
+```bash
+python infra/db/scripts/compare_embedding_models.py --sample-size 200 --query-count 30 --neighbor-k 10 --label minilm-vs-qwen
 ```
 
 샘플 검증 쿼리:
@@ -104,3 +137,29 @@ WHERE search_vector @@ plainto_tsquery('korean', '무궁화 꽃')
 ORDER BY rank DESC
 LIMIT 5;
 ```
+
+## 검색 API: embeddingModel 선택(base/qwen3)
+
+하이브리드 검색 엔드포인트는 임베딩 모델을 선택할 수 있습니다.
+
+- `embeddingModel: "base"` → `namuwiki_documents.embedding` (`VECTOR(384)`) 사용
+- `embeddingModel: "qwen3"` → `namuwiki_document_embeddings_qwen.embedding` (`VECTOR(1024)`) 사용
+- 미지정 시 기본값은 `base`
+
+요청 예시:
+
+```bash
+curl -X POST http://localhost:3000/api/search/hybrid \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "ARM 아키텍처",
+    "offset": 0,
+    "limit": 10,
+    "mode": "hnsw",
+    "bm25Enabled": true,
+    "hybridRatio": 50,
+    "embeddingModel": "qwen3"
+  }'
+```
+
+응답 `meta`에는 실제 사용 모델이 `embeddingModelUsed`로 내려옵니다.

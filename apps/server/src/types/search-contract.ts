@@ -1,11 +1,13 @@
 import type { tags } from 'typia'
 
 export type SearchMode = 'none' | 'hnsw' | 'ivf'
+export type EmbeddingModel = 'base' | 'qwen3'
 
 export interface SearchRequest {
   query: string & tags.MinLength<1> & tags.MaxLength<200>
   offset?: number & tags.Type<'int32'> & tags.Minimum<0>
   limit?: number & tags.Type<'int32'> & tags.Minimum<1> & tags.Maximum<100>
+  embeddingModel?: EmbeddingModel
 }
 
 export interface SearchHybridRequest extends SearchRequest {
@@ -20,6 +22,7 @@ export interface ApiMeta {
   limit: number
   tookMs?: number
   requestId?: string
+  embeddingModelUsed?: EmbeddingModel
 }
 
 export interface ApiResponse<T> {

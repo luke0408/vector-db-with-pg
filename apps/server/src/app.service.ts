@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common'
 import { PrismaService } from './prisma/prisma.service'
+import type { EmbeddingModel } from './types/search-contract'
 
 export interface SearchResult {
   id: number
@@ -45,12 +46,14 @@ export interface SearchResponseData {
 export interface SearchQueryOptions {
   offset: number
   limit: number
+  embeddingModel?: EmbeddingModel
 }
 
 export interface SearchHybridOptions extends SearchQueryOptions {
   mode: 'none' | 'hnsw' | 'ivf'
   bm25Enabled: boolean
   hybridRatio: number
+  embeddingModel: EmbeddingModel
 }
 
 interface HybridSearchRow {
@@ -316,23 +319,28 @@ export class AppService {
     const rankingStrategy = options.bm25Enabled ? 'vector+bm25-hybrid' : 'vector-distance-only'
     const normalizeAndAnalyzeMs = Date.now() - analyzeStartedAt
 
+    const sourceJoin = options.embeddingModel === 'qwen3'
+      ? 'namuwiki_document_embeddings_qwen qe JOIN namuwiki_documents d ON d.doc_hash = qe.doc_hash'
+      : 'namuwiki_documents d'
+    const embeddingExpr = options.embeddingModel === 'qwen3' ? 'qe.embedding' : 'd.embedding'
+
     const seedTitleVectorSql = `
-      SELECT embedding::text AS query_vector
-      FROM namuwiki_documents
-      WHERE embedding IS NOT NULL
-        AND to_tsvector('korean', COALESCE(title, '')) @@ to_tsquery('korean', $1)
-      ORDER BY id DESC
+      SELECT ${embeddingExpr}::text AS query_vector
+      FROM ${sourceJoin}
+      WHERE ${embeddingExpr} IS NOT NULL
+        AND to_tsvector('korean', COALESCE(d.title, '')) @@ to_tsquery('korean', $1)
+      ORDER BY d.id DESC
       LIMIT 1
     `
 
     const queryVectorSql = `
-      SELECT embedding::text AS query_vector
-      FROM namuwiki_documents
-      WHERE search_vector @@ to_tsquery('korean', $1)
-        AND embedding IS NOT NULL
+      SELECT ${embeddingExpr}::text AS query_vector
+      FROM ${sourceJoin}
+      WHERE d.search_vector @@ to_tsquery('korean', $1)
+        AND ${embeddingExpr} IS NOT NULL
       ORDER BY
         CASE
-          WHEN to_tsvector('korean', COALESCE(title, '')) @@ to_tsquery('korean', $2) THEN 1
+          WHEN to_tsvector('korean', COALESCE(d.title, '')) @@ to_tsquery('korean', $2) THEN 1
           ELSE 0
         END DESC,
         id DESC
@@ -340,28 +348,28 @@ export class AppService {
     `
 
     const queryVectorFastSql = `
-      SELECT embedding::text AS query_vector
-      FROM namuwiki_documents
-      WHERE search_vector @@ to_tsquery('korean', $1)
-        AND embedding IS NOT NULL
-      ORDER BY id DESC
+      SELECT ${embeddingExpr}::text AS query_vector
+      FROM ${sourceJoin}
+      WHERE d.search_vector @@ to_tsquery('korean', $1)
+        AND ${embeddingExpr} IS NOT NULL
+      ORDER BY d.id DESC
       LIMIT 1
     `
 
     const fallbackVectorSql = `
-      SELECT embedding::text AS query_vector
-      FROM namuwiki_documents
-      WHERE embedding IS NOT NULL
+      SELECT ${embeddingExpr}::text AS query_vector
+      FROM ${sourceJoin}
+      WHERE ${embeddingExpr} IS NOT NULL
         AND (
-          LOWER(COALESCE(title, '')) LIKE $1
-          OR LOWER(content) LIKE $2
+          LOWER(COALESCE(d.title, '')) LIKE $1
+          OR LOWER(d.content) LIKE $2
         )
       ORDER BY CASE
-          WHEN LOWER(COALESCE(title, '')) LIKE $1 THEN 2
-          WHEN LOWER(content) LIKE $2 THEN 1
+          WHEN LOWER(COALESCE(d.title, '')) LIKE $1 THEN 2
+          WHEN LOWER(d.content) LIKE $2 THEN 1
           ELSE 0
         END DESC,
-        id DESC
+        d.id DESC
       LIMIT 1
     `
 
@@ -372,11 +380,11 @@ export class AppService {
     const annSql = `
       WITH ann_candidates AS (
         SELECT
-          id,
-          embedding ${distanceOperator} $1::vector AS vector_distance
-        FROM namuwiki_documents
-        WHERE embedding IS NOT NULL
-        ORDER BY embedding ${distanceOperator} $1::vector
+          d.id AS id,
+          ${embeddingExpr} ${distanceOperator} $1::vector AS vector_distance
+        FROM ${sourceJoin}
+        WHERE ${embeddingExpr} IS NOT NULL
+        ORDER BY ${embeddingExpr} ${distanceOperator} $1::vector
         LIMIT $2
       ),
       ranked_candidates AS (
@@ -429,10 +437,10 @@ export class AppService {
 
     const annCountSql = `
       WITH ann_candidates AS (
-        SELECT id
-        FROM namuwiki_documents
-        WHERE embedding IS NOT NULL
-        ORDER BY embedding ${distanceOperator} $1::vector
+        SELECT d.id AS id
+        FROM ${sourceJoin}
+        WHERE ${embeddingExpr} IS NOT NULL
+        ORDER BY ${embeddingExpr} ${distanceOperator} $1::vector
         LIMIT $2
       )
       SELECT COUNT(*)::bigint AS total
@@ -523,7 +531,7 @@ export class AppService {
           total: 0,
           learning: {
             generatedSql:
-              `${seedTitleVectorSql.trim()}\n${queryVectorSql.trim()}\n${queryVectorFastSql.trim()}\n${fallbackVectorSql.trim()}\n-- no seed embedding found for query, ANN skipped\n-- mode: ${effectiveMode}, bm25: ${options.bm25Enabled}, hybridRatio: ${options.hybridRatio}, ranking: ${rankingStrategy}, technicalSeedTsQuery: ${technicalSeedExpression || 'none'}`,
+              `${seedTitleVectorSql.trim()}\n${queryVectorSql.trim()}\n${queryVectorFastSql.trim()}\n${fallbackVectorSql.trim()}\n-- no seed embedding found for query, ANN skipped\n-- embeddingModel: ${options.embeddingModel}, mode: ${effectiveMode}, bm25: ${options.bm25Enabled}, hybridRatio: ${options.hybridRatio}, ranking: ${rankingStrategy}, technicalSeedTsQuery: ${technicalSeedExpression || 'none'}`,
             executionPlan: {
               Plan: {
                 'Node Type': 'Unavailable',
@@ -626,7 +634,7 @@ export class AppService {
         items: mappedItems,
           total,
         learning: {
-          generatedSql: `${seedTitleVectorSql.trim()}\n${queryVectorSql.trim()}\n${queryVectorFastSql.trim()}\n${fallbackVectorSql.trim()}\n${annSql.trim()}\n-- mode: ${effectiveMode}, bm25: ${options.bm25Enabled}, hybridRatio: ${options.hybridRatio}, candidatePool: ${candidatePool}, tsConfig: ${tsConfig}, shortQueryStrategy: ${isShortAmbiguousQuery ? 'seed-priority' : 'standard'}, longQueryStrategy: ${isLongNaturalLanguageQuery ? 'term-selected-tsquery' : 'default'}, ranking: ${rankingStrategy}, domainAnchor: ${hasDomainAnchor ? 'on' : 'off'}, technicalSeedTsQuery: ${technicalSeedExpression || 'none'}, rankTsQuery: ${rankQueryExpression}`,
+          generatedSql: `${seedTitleVectorSql.trim()}\n${queryVectorSql.trim()}\n${queryVectorFastSql.trim()}\n${fallbackVectorSql.trim()}\n${annSql.trim()}\n-- embeddingModel: ${options.embeddingModel}, mode: ${effectiveMode}, bm25: ${options.bm25Enabled}, hybridRatio: ${options.hybridRatio}, candidatePool: ${candidatePool}, tsConfig: ${tsConfig}, shortQueryStrategy: ${isShortAmbiguousQuery ? 'seed-priority' : 'standard'}, longQueryStrategy: ${isLongNaturalLanguageQuery ? 'term-selected-tsquery' : 'default'}, ranking: ${rankingStrategy}, domainAnchor: ${hasDomainAnchor ? 'on' : 'off'}, technicalSeedTsQuery: ${technicalSeedExpression || 'none'}, rankTsQuery: ${rankQueryExpression}`,
           executionPlan,
           queryExplanation: `${this.buildQueryExplanation(executionPlan)} Keywords used: ${weightedKeywords.join(', ') || 'none'}.`,
           keywordSignals,
