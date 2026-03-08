@@ -16,6 +16,9 @@ import type {
   Bm25LanguageStatus,
   Bm25SettingsUpdateRequest,
   ManagedDocumentMutationResult,
+  ManagedTableBackfillEvent,
+  ManagedTableBackfillState,
+  ManagedTableBackfillStatus,
   ManagedDocumentUpsertRequest,
   ManagedLanguageSummary,
   ManagedTableSummary,
@@ -75,7 +78,6 @@ interface ResolvedRegisterExistingTableConfig {
   embeddingHnswDim: number
   reductionMethod: string
   description: string | null
-  initializeData: boolean
   makeDefault: boolean
 }
 
@@ -83,6 +85,9 @@ const SAFE_IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 const DEFAULT_EMBEDDING_DIM = 1024
 const DEFAULT_HNSW_DIM = 1024
 const DEFAULT_REDUCTION_METHOD = 'prefix_truncation'
+const DEFAULT_BACKFILL_CHUNK_SIZE = 100
+const MAX_BACKFILL_CHUNK_SIZE = 1000
+const ENABLED_TEXT_SEARCH_LANGUAGES = ['english', 'korean', 'japanese', 'chinese'] as const
 
 
 type RawClient = Pick<
@@ -104,6 +109,46 @@ interface ManagedDocumentSnapshot {
   ftsText: string | null
 }
 
+interface ManagedTableStatusRow {
+  table_name: string
+  row_count: bigint | number
+  embedding_coverage: number
+  fts_coverage: number
+  embedding_ready: boolean
+  fts_ready: boolean
+  bm25_ready: boolean
+  search_eligible: boolean
+  backfill_status: ManagedTableBackfillState
+  backfill_total_rows: bigint | number
+  backfill_processed_rows: bigint | number
+  backfill_last_processed_id: bigint | number | null
+  backfill_cancel_requested: boolean
+  backfill_last_started_at: Date | null
+  backfill_last_completed_at: Date | null
+  backfill_last_error: string | null
+}
+
+interface TableBm25QueueRow {
+  pending: bigint | number
+  in_progress: bigint | number
+}
+
+interface TableBm25LengthRow {
+  recordcount: bigint | number
+}
+
+interface TableBackfillChunkRow {
+  id: bigint | number
+  docHash: string | null
+  title: string | null
+  content: string
+  textlen: number | null
+  ftsText: string | null
+  embeddingText: string | null
+  embeddingHnswText: string | null
+  legacyEmbeddingText: string | null
+}
+
 @Injectable()
 export class AdminService {
   private bootstrapPromise: Promise<void> | null = null
@@ -113,23 +158,27 @@ export class AdminService {
   async listLanguages(): Promise<ManagedLanguageSummary[]> {
     await this.ensureBootstrap()
 
-    const rows = await this.query<LanguageSettingsRow>(`
-      SELECT
-        sl.language,
-        sl.table_suffix,
-        settings.k1,
-        settings.b,
-        settings.last_indexed_at,
-        COUNT(mt.table_name)::bigint AS managed_table_count
-      FROM search_supported_languages sl
-      JOIN search_bm25_language_settings settings
-        ON settings.language = sl.language
-      LEFT JOIN search_managed_tables mt
-        ON mt.language = sl.language
-       AND mt.is_active = TRUE
-      GROUP BY sl.language, sl.table_suffix, settings.k1, settings.b, settings.last_indexed_at
-      ORDER BY sl.language ASC
-    `)
+    const rows = await this.query<LanguageSettingsRow>(
+      `
+        SELECT
+          sl.language,
+          sl.table_suffix,
+          settings.k1,
+          settings.b,
+          settings.last_indexed_at,
+          COUNT(mt.table_name)::bigint AS managed_table_count
+        FROM search_supported_languages sl
+        JOIN search_bm25_language_settings settings
+          ON settings.language = sl.language
+        LEFT JOIN search_managed_tables mt
+          ON mt.language = sl.language
+         AND mt.is_active = TRUE
+        WHERE sl.language = ANY($1::text[])
+        GROUP BY sl.language, sl.table_suffix, settings.k1, settings.b, settings.last_indexed_at
+        ORDER BY sl.language ASC
+      `,
+      [...ENABLED_TEXT_SEARCH_LANGUAGES]
+    )
 
     return Promise.all(
       rows.map(async (row) => {
@@ -158,7 +207,12 @@ export class AdminService {
   async listManagedTables(): Promise<ManagedTableSummary[]> {
     await this.ensureBootstrap()
 
-    const rows = await this.query<ManagedTableRow & { last_indexed_at: Date | null }>(`
+    const rows = await this.query<
+      ManagedTableRow &
+      ManagedTableStatusRow & {
+        last_indexed_at: Date | null
+      }
+    >(`
       SELECT
         mt.table_name,
         mt.id_column,
@@ -176,35 +230,57 @@ export class AdminService {
         mt.description,
         mt.is_default,
         mt.is_active,
-        settings.last_indexed_at
+        settings.last_indexed_at,
+        COALESCE(status.row_count, 0)::bigint AS row_count,
+        COALESCE(status.embedding_coverage, 0)::double precision AS embedding_coverage,
+        COALESCE(status.fts_coverage, 0)::double precision AS fts_coverage,
+        COALESCE(status.embedding_ready, FALSE) AS embedding_ready,
+        COALESCE(status.fts_ready, FALSE) AS fts_ready,
+        COALESCE(status.bm25_ready, FALSE) AS bm25_ready,
+        COALESCE(status.search_eligible, FALSE) AS search_eligible,
+        COALESCE(status.backfill_status, 'idle') AS backfill_status,
+        COALESCE(status.backfill_total_rows, 0)::bigint AS backfill_total_rows,
+        COALESCE(status.backfill_processed_rows, 0)::bigint AS backfill_processed_rows,
+        status.backfill_last_processed_id,
+        COALESCE(status.backfill_cancel_requested, FALSE) AS backfill_cancel_requested,
+        status.backfill_last_started_at,
+        status.backfill_last_completed_at,
+        status.backfill_last_error
       FROM search_managed_tables mt
       LEFT JOIN search_bm25_language_settings settings
         ON settings.language = mt.language
+      LEFT JOIN search_managed_table_status status
+        ON status.table_name = mt.table_name
       ORDER BY mt.is_default DESC, mt.table_name ASC
     `)
 
-    return Promise.all(
-      rows.map(async (row) => ({
-        tableName: row.table_name,
-        language: row.language,
-        idColumn: row.id_column,
-        docHashColumn: row.doc_hash_column,
-        titleColumn: row.title_column,
-        contentColumn: row.content_column,
-        textlenColumn: row.textlen_column,
-        ftsColumn: row.fts_column,
-        embeddingColumn: row.embedding_column,
-        embeddingHnswColumn: row.embedding_hnsw_column,
-        embeddingDim: Number(row.embedding_dim),
-        embeddingHnswDim: Number(row.embedding_hnsw_dim),
-        reductionMethod: row.reduction_method,
-        description: row.description,
-        isDefault: Boolean(row.is_default),
-        isActive: Boolean(row.is_active),
-        rowCount: await this.getTableRowCount(row.table_name),
-        lastIndexedAt: row.last_indexed_at?.toISOString() ?? null
-      }))
-    )
+    return rows.map((row) => ({
+      tableName: row.table_name,
+      language: row.language,
+      idColumn: row.id_column,
+      docHashColumn: row.doc_hash_column,
+      titleColumn: row.title_column,
+      contentColumn: row.content_column,
+      textlenColumn: row.textlen_column,
+      ftsColumn: row.fts_column,
+      embeddingColumn: row.embedding_column,
+      embeddingHnswColumn: row.embedding_hnsw_column,
+      embeddingDim: Number(row.embedding_dim),
+      embeddingHnswDim: Number(row.embedding_hnsw_dim),
+      reductionMethod: row.reduction_method,
+      description: row.description,
+      isDefault: Boolean(row.is_default),
+      isActive: Boolean(row.is_active),
+      rowCount: Number(row.row_count ?? 0),
+      lastIndexedAt: row.last_indexed_at?.toISOString() ?? null,
+      embeddingCoverage: Number(row.embedding_coverage ?? 0),
+      ftsCoverage: Number(row.fts_coverage ?? 0),
+      embeddingReady: Boolean(row.embedding_ready),
+      ftsReady: Boolean(row.fts_ready),
+      bm25Ready: Boolean(row.bm25_ready),
+      searchEligible: Boolean(row.search_eligible),
+      backfill: this.mapBackfillStatusRow(row)
+    }))
   }
 
   async getBm25LanguageStatus(language: string): Promise<Bm25LanguageStatus> {
@@ -265,24 +341,11 @@ export class AdminService {
 
     await this.ensureColumnsForManagedTable(config)
     await this.upsertManagedTable(config)
-
-    if (config.makeDefault) {
-      await this.exec(`UPDATE search_managed_tables SET is_default = FALSE WHERE table_name <> $1`, config.tableName)
-      await this.exec(`UPDATE search_managed_tables SET is_default = TRUE WHERE table_name = $1`, config.tableName)
-    } else {
-      const [defaultCountRow] = await this.query<CountRow>(
-        `SELECT COUNT(*)::bigint AS count FROM search_managed_tables WHERE is_default = TRUE`
-      )
-
-      if (Number(defaultCountRow?.count ?? 0) === 0) {
-        await this.exec(`UPDATE search_managed_tables SET is_default = TRUE WHERE table_name = $1`, config.tableName)
-      }
-    }
-
-    if (config.initializeData) {
-      await this.initializeManagedTableData(config)
-      await this.rebuildLanguageSnapshot(config.language)
-    }
+    await this.ensureManagedTableStatusRow(config.tableName)
+    await this.refreshManagedTableStatus(config.tableName)
+    await this.reconcileDefaultManagedTables(
+      config.makeDefault ? config.tableName : undefined
+    )
 
     const [table] = (await this.listManagedTables()).filter(
       (candidate) => candidate.tableName === config.tableName
@@ -296,7 +359,6 @@ export class AdminService {
 
     return {
       table,
-      initializedData: config.initializeData,
       bm25LanguageStatus
     }
   }
@@ -354,10 +416,12 @@ export class AdminService {
       throw new Error('content must be provided as string')
     }
 
+    this.assertEmbeddingPayloadPresent(request)
+
     const title = request.title ?? null
     const content = request.content
 
-    return this.prismaService.$transaction(async (tx) => {
+    const result = await this.prismaService.$transaction(async (tx) => {
       const ftsPayload = await this.computeFtsPayload(config.language, title, content, tx)
       const insertParams: unknown[] = []
       const columns: string[] = []
@@ -392,15 +456,12 @@ export class AdminService {
       const embeddingLiteral = request.embedding
         ? this.toVectorLiteral(request.embedding, config.embedding_dim, 'embedding')
         : null
-      const embeddingHnswLiteral = request.embeddingHnsw
-        ? this.toVectorLiteral(
-            request.embeddingHnsw,
-            config.embedding_hnsw_dim,
-            'embeddingHnsw'
-          )
-        : (embeddingLiteral && config.embedding_dim === config.embedding_hnsw_dim
-            ? embeddingLiteral
-            : null)
+      const embeddingHnswLiteral = this.resolveEmbeddingHnswLiteral(
+        config.embedding_hnsw_dim,
+        request.embeddingHnsw,
+        request.embedding,
+        config.embedding_dim
+      )
 
       if (embeddingLiteral) {
         columns.push(this.quoteIdentifier(config.embedding_column))
@@ -447,9 +508,13 @@ export class AdminService {
         language: config.language,
         id: insertedId,
         taskQueued: true,
-        taskType: 'insert'
+        taskType: 'insert' as const
       }
     })
+
+    await this.refreshManagedTableStatus(config.table_name)
+    await this.reconcileDefaultManagedTables()
+    return result
   }
 
   async updateManagedDocument(
@@ -461,7 +526,9 @@ export class AdminService {
 
     const config = await this.getManagedTableRowOrThrow(tableName)
 
-    return this.prismaService.$transaction(async (tx) => {
+    this.assertEmbeddingPayloadPresent(request)
+
+    const result = await this.prismaService.$transaction(async (tx) => {
       const existing = await this.getManagedDocumentSnapshot(config, id, tx)
 
       if (!existing) {
@@ -507,13 +574,15 @@ export class AdminService {
       const embeddingLiteral = request.embedding
         ? this.toVectorLiteral(request.embedding, config.embedding_dim, 'embedding')
         : null
-      const embeddingHnswLiteral = request.embeddingHnsw
-        ? this.toVectorLiteral(
-            request.embeddingHnsw,
-            config.embedding_hnsw_dim,
-            'embeddingHnsw'
-          )
-        : undefined
+      const embeddingHnswLiteral =
+        request.embeddingHnsw !== undefined || request.embedding !== undefined
+          ? this.resolveEmbeddingHnswLiteral(
+              config.embedding_hnsw_dim,
+              request.embeddingHnsw,
+              request.embedding,
+              config.embedding_dim
+            )
+          : undefined
 
       if (request.embedding !== undefined) {
         params.push(embeddingLiteral)
@@ -523,12 +592,8 @@ export class AdminService {
       if (request.embeddingHnsw !== undefined) {
         params.push(embeddingHnswLiteral ?? null)
         updates.push(`${this.quoteIdentifier(config.embedding_hnsw_column)} = $${params.length}::vector`)
-      } else if (
-        request.embedding !== undefined &&
-        embeddingLiteral &&
-        config.embedding_dim === config.embedding_hnsw_dim
-      ) {
-        params.push(embeddingLiteral)
+      } else if (request.embedding !== undefined && embeddingHnswLiteral) {
+        params.push(embeddingHnswLiteral)
         updates.push(`${this.quoteIdentifier(config.embedding_hnsw_column)} = $${params.length}::vector`)
       }
 
@@ -570,9 +635,13 @@ export class AdminService {
         language: config.language,
         id,
         taskQueued: true,
-        taskType: 'update'
+        taskType: 'update' as const
       }
     })
+
+    await this.refreshManagedTableStatus(config.table_name)
+    await this.reconcileDefaultManagedTables()
+    return result
   }
 
   async deleteManagedDocument(
@@ -583,7 +652,7 @@ export class AdminService {
 
     const config = await this.getManagedTableRowOrThrow(tableName)
 
-    return this.prismaService.$transaction(async (tx) => {
+    const result = await this.prismaService.$transaction(async (tx) => {
       const existing = await this.getManagedDocumentSnapshot(config, id, tx)
 
       if (!existing) {
@@ -617,9 +686,13 @@ export class AdminService {
         language: config.language,
         id,
         taskQueued: true,
-        taskType: 'delete'
+        taskType: 'delete' as const
       }
     })
+
+    await this.refreshManagedTableStatus(config.table_name)
+    await this.reconcileDefaultManagedTables()
+    return result
   }
 
   async runBm25Indexing(
@@ -661,6 +734,7 @@ export class AdminService {
           remainingTasks: await this.countRemainingTasks(supportedLanguage.table_suffix),
           elapsedMs: Date.now() - startedAt
         })
+        await this.reconcileDefaultManagedTables()
         return
       }
 
@@ -670,6 +744,10 @@ export class AdminService {
       )
 
       if (claimedTasks.length === 0) {
+        await this.refreshManagedTableStatuses(
+          await this.listManagedTableNamesForLanguage(normalizedLanguage)
+        )
+        await this.reconcileDefaultManagedTables()
         emit({
           event: 'completed',
           language: normalizedLanguage,
@@ -691,6 +769,10 @@ export class AdminService {
         supportedLanguage.table_suffix,
         claimedTasks.map((task) => task.rowId)
       )
+      await this.refreshManagedTableStatuses(
+        Array.from(new Set(consolidated.map((task) => task.tableName)))
+      )
+      await this.reconcileDefaultManagedTables()
 
       processedTasks += claimedTasks.length
 
@@ -706,6 +788,282 @@ export class AdminService {
       })
     }
   }
+
+  async prepareTableBackfill(tableName: string): Promise<ManagedTableBackfillStatus> {
+    await this.ensureBootstrap()
+
+    const config = await this.getManagedTableRowOrThrow(tableName)
+    const totalRows = await this.countRowsNeedingBackfill(
+      config,
+      !(await this.isBm25ReadyForTable(config.table_name))
+    )
+
+    await this.ensureManagedTableStatusRow(config.table_name)
+    await this.exec(
+      `
+        UPDATE search_managed_table_status
+        SET
+          backfill_status = 'idle',
+          backfill_total_rows = $2,
+          backfill_processed_rows = 0,
+          backfill_last_processed_id = NULL,
+          backfill_cancel_requested = FALSE,
+          backfill_last_started_at = NULL,
+          backfill_last_completed_at = NULL,
+          backfill_last_error = NULL,
+          updated_at = NOW()
+        WHERE table_name = $1
+      `,
+      config.table_name,
+      totalRows
+    )
+
+    await this.refreshManagedTableStatus(config.table_name)
+    return this.getManagedTableBackfillStatus(config.table_name)
+  }
+
+  async getManagedTableBackfillStatus(
+    tableName: string
+  ): Promise<ManagedTableBackfillStatus> {
+    await this.ensureBootstrap()
+
+    const normalizedTableName = this.ensureSafeIdentifier(tableName)
+    await this.ensureManagedTableStatusRow(normalizedTableName)
+
+    const [row] = await this.query<ManagedTableStatusRow>(
+      `
+        SELECT
+          table_name,
+          row_count,
+          embedding_coverage,
+          fts_coverage,
+          embedding_ready,
+          fts_ready,
+          bm25_ready,
+          search_eligible,
+          backfill_status,
+          backfill_total_rows,
+          backfill_processed_rows,
+          backfill_last_processed_id,
+          backfill_cancel_requested,
+          backfill_last_started_at,
+          backfill_last_completed_at,
+          backfill_last_error
+        FROM search_managed_table_status
+        WHERE table_name = $1
+      `,
+      normalizedTableName
+    )
+
+    if (!row) {
+      throw new Error(`Managed table status not found for ${normalizedTableName}`)
+    }
+
+    return this.mapBackfillStatusRow(row)
+  }
+
+  async cancelTableBackfill(tableName: string): Promise<ManagedTableBackfillStatus> {
+    await this.ensureBootstrap()
+
+    const config = await this.getManagedTableRowOrThrow(tableName)
+    await this.ensureManagedTableStatusRow(config.table_name)
+
+    await this.exec(
+      `
+        UPDATE search_managed_table_status
+        SET
+          backfill_cancel_requested = TRUE,
+          backfill_status = CASE
+            WHEN backfill_status = 'idle' THEN 'cancelled'
+            ELSE backfill_status
+          END,
+          updated_at = NOW()
+        WHERE table_name = $1
+      `,
+      config.table_name
+    )
+
+    await this.refreshManagedTableStatus(config.table_name)
+    await this.reconcileDefaultManagedTables()
+
+    return this.getManagedTableBackfillStatus(config.table_name)
+  }
+
+  async runManagedTableBackfill(
+    tableName: string,
+    chunkSize: number,
+    emit: (event: ManagedTableBackfillEvent) => void,
+    isCancelled: () => boolean
+  ): Promise<void> {
+    await this.ensureBootstrap()
+
+    const config = await this.getManagedTableRowOrThrow(tableName)
+    const normalizedChunkSize = Math.max(
+      1,
+      Math.min(Math.trunc(chunkSize || DEFAULT_BACKFILL_CHUNK_SIZE), MAX_BACKFILL_CHUNK_SIZE)
+    )
+    const startedAt = Date.now()
+    let status = await this.getManagedTableBackfillStatus(config.table_name)
+    const totalRowsForRun =
+      status.totalRows > 0
+        ? status.totalRows
+        : await this.countRowsNeedingBackfill(
+            config,
+            !(await this.isBm25ReadyForTable(config.table_name))
+          )
+
+    await this.exec(
+      `
+        UPDATE search_managed_table_status
+        SET
+          backfill_status = 'running',
+          backfill_total_rows = CASE
+            WHEN backfill_total_rows > 0 THEN backfill_total_rows
+            ELSE $2
+          END,
+          backfill_cancel_requested = FALSE,
+          backfill_last_started_at = NOW(),
+          backfill_last_error = NULL,
+          updated_at = NOW()
+        WHERE table_name = $1
+      `,
+      config.table_name,
+      totalRowsForRun
+    )
+    status = await this.getManagedTableBackfillStatus(config.table_name)
+
+    emit({
+      event: 'started',
+      tableName: config.table_name,
+      chunkSize: normalizedChunkSize,
+      processedRows: status.processedRows,
+      remainingRows: status.remainingRows
+    })
+
+    while (true) {
+      const currentStatus = await this.getManagedTableBackfillStatus(config.table_name)
+
+      if (isCancelled() || currentStatus.cancelRequested) {
+        await this.exec(
+          `
+            UPDATE search_managed_table_status
+            SET
+              backfill_status = 'cancelled',
+              backfill_cancel_requested = TRUE,
+              updated_at = NOW()
+            WHERE table_name = $1
+          `,
+          config.table_name
+        )
+        await this.refreshManagedTableStatus(config.table_name)
+        await this.reconcileDefaultManagedTables()
+        emit({
+          event: 'cancelled',
+          tableName: config.table_name,
+          chunkSize: normalizedChunkSize,
+          processedRows: currentStatus.processedRows,
+          remainingRows: currentStatus.remainingRows,
+          elapsedMs: Date.now() - startedAt
+        })
+        return
+      }
+
+      const snapshotIncomplete = !(await this.isBm25ReadyForTable(config.table_name))
+      const chunkRows = await this.loadBackfillChunk(
+        config,
+        currentStatus.lastProcessedId,
+        normalizedChunkSize,
+        snapshotIncomplete
+      )
+
+      if (chunkRows.length === 0) {
+        await this.exec(
+          `
+            UPDATE search_managed_table_status
+            SET
+              backfill_status = 'completed',
+              backfill_cancel_requested = FALSE,
+              backfill_last_completed_at = NOW(),
+              updated_at = NOW()
+            WHERE table_name = $1
+          `,
+          config.table_name
+        )
+        await this.refreshManagedTableStatus(config.table_name)
+        await this.reconcileDefaultManagedTables(config.table_name)
+        const completedStatus = await this.getManagedTableBackfillStatus(config.table_name)
+        emit({
+          event: 'completed',
+          tableName: config.table_name,
+          chunkSize: normalizedChunkSize,
+          processedRows: completedStatus.processedRows,
+          remainingRows: completedStatus.remainingRows,
+          elapsedMs: Date.now() - startedAt
+        })
+        return
+      }
+
+      try {
+        const processedChunk = await this.processBackfillChunk(
+          config,
+          chunkRows,
+          snapshotIncomplete
+        )
+        const lastProcessedId = processedChunk[processedChunk.length - 1]?.id ?? currentStatus.lastProcessedId ?? null
+        await this.exec(
+          `
+            UPDATE search_managed_table_status
+            SET
+              backfill_status = 'running',
+              backfill_processed_rows = LEAST(backfill_total_rows, backfill_processed_rows + $2),
+              backfill_last_processed_id = $3,
+              backfill_cancel_requested = FALSE,
+              updated_at = NOW()
+            WHERE table_name = $1
+          `,
+          config.table_name,
+          processedChunk.length,
+          lastProcessedId
+        )
+        await this.refreshManagedTableStatus(config.table_name)
+        const nextStatus = await this.getManagedTableBackfillStatus(config.table_name)
+        emit({
+          event: 'chunk',
+          tableName: config.table_name,
+          chunkSize: normalizedChunkSize,
+          processedRows: nextStatus.processedRows,
+          remainingRows: nextStatus.remainingRows,
+          updatedRows: processedChunk.length,
+          elapsedMs: Date.now() - startedAt
+        })
+      } catch (error) {
+        await this.exec(
+          `
+            UPDATE search_managed_table_status
+            SET
+              backfill_status = 'error',
+              backfill_last_error = $2,
+              updated_at = NOW()
+            WHERE table_name = $1
+          `,
+          config.table_name,
+          this.describeError(error)
+        )
+        await this.refreshManagedTableStatus(config.table_name)
+        emit({
+          event: 'error',
+          tableName: config.table_name,
+          chunkSize: normalizedChunkSize,
+          processedRows: currentStatus.processedRows,
+          remainingRows: currentStatus.remainingRows,
+          elapsedMs: Date.now() - startedAt,
+          message: this.describeError(error)
+        })
+        throw error
+      }
+    }
+  }
+
   private async ensureBootstrap(): Promise<void> {
     if (!this.bootstrapPromise) {
       this.bootstrapPromise = this.performBootstrap().catch((error) => {
@@ -722,6 +1080,9 @@ export class AdminService {
     const languages = await this.syncSupportedLanguages()
     await this.ensureNamuwikiPhaseOneColumns()
     await this.ensureNamuwikiManagedRegistration(languages)
+    await this.ensureManagedTableStatusRows()
+    await this.refreshManagedTableStatuses(await this.listAllManagedTableNames())
+    await this.reconcileDefaultManagedTables()
   }
 
   private async ensureFoundationTables(): Promise<void> {
@@ -767,6 +1128,27 @@ export class AdminService {
           updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
       `,
+      `
+        CREATE TABLE IF NOT EXISTS search_managed_table_status (
+          table_name TEXT PRIMARY KEY REFERENCES search_managed_tables(table_name) ON DELETE CASCADE,
+          row_count BIGINT NOT NULL DEFAULT 0,
+          embedding_coverage DOUBLE PRECISION NOT NULL DEFAULT 0,
+          fts_coverage DOUBLE PRECISION NOT NULL DEFAULT 0,
+          embedding_ready BOOLEAN NOT NULL DEFAULT FALSE,
+          fts_ready BOOLEAN NOT NULL DEFAULT FALSE,
+          bm25_ready BOOLEAN NOT NULL DEFAULT FALSE,
+          search_eligible BOOLEAN NOT NULL DEFAULT FALSE,
+          backfill_status TEXT NOT NULL DEFAULT 'idle',
+          backfill_total_rows BIGINT NOT NULL DEFAULT 0,
+          backfill_processed_rows BIGINT NOT NULL DEFAULT 0,
+          backfill_last_processed_id BIGINT,
+          backfill_cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
+          backfill_last_started_at TIMESTAMPTZ,
+          backfill_last_completed_at TIMESTAMPTZ,
+          backfill_last_error TEXT,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `,
       `CREATE UNIQUE INDEX IF NOT EXISTS idx_search_managed_tables_default ON search_managed_tables ((is_default)) WHERE is_default = TRUE`,
       `
         CREATE OR REPLACE FUNCTION bm25_tsvector_token_stats(input_vector tsvector)
@@ -804,10 +1186,22 @@ export class AdminService {
 
   private async syncSupportedLanguages(): Promise<SupportedLanguageRow[]> {
     const configs = await this.query<{ cfgname: string }>(
-      `SELECT cfgname FROM pg_ts_config ORDER BY cfgname ASC`
+      `
+        SELECT cfgname
+        FROM pg_ts_config
+        WHERE cfgname = ANY($1::text[])
+        ORDER BY cfgname ASC
+      `,
+      [...ENABLED_TEXT_SEARCH_LANGUAGES]
     )
     const existingRows = await this.query<SupportedLanguageRow>(
-      `SELECT language, table_suffix FROM search_supported_languages ORDER BY language ASC`
+      `
+        SELECT language, table_suffix
+        FROM search_supported_languages
+        WHERE language = ANY($1::text[])
+        ORDER BY language ASC
+      `,
+      [...ENABLED_TEXT_SEARCH_LANGUAGES]
     )
     const existingByLanguage = new Map(
       existingRows.map((row) => [row.language, row.table_suffix])
@@ -848,7 +1242,13 @@ export class AdminService {
     }
 
     return this.query<SupportedLanguageRow>(
-      `SELECT language, table_suffix FROM search_supported_languages ORDER BY language ASC`
+      `
+        SELECT language, table_suffix
+        FROM search_supported_languages
+        WHERE language = ANY($1::text[])
+        ORDER BY language ASC
+      `,
+      [...ENABLED_TEXT_SEARCH_LANGUAGES]
     )
   }
 
@@ -929,7 +1329,6 @@ export class AdminService {
       embeddingHnswDim: DEFAULT_HNSW_DIM,
       reductionMethod: DEFAULT_REDUCTION_METHOD,
       description: 'Phase 1 managed registration for existing NamuWiki documents.',
-      initializeData: false,
       makeDefault: true
     })
   }
@@ -945,9 +1344,11 @@ export class AdminService {
 
     const preferredLanguage =
       languages.find((row) => row.language === 'korean')?.language ??
-      languages.find((row) => row.language === 'simple')?.language ??
+      languages.find((row) => row.language === 'english')?.language ??
+      languages.find((row) => row.language === 'japanese')?.language ??
+      languages.find((row) => row.language === 'chinese')?.language ??
       languages[0]?.language ??
-      'simple'
+      'korean'
 
     const [defaultCountRow] = await this.query<CountRow>(
       `SELECT COUNT(*)::bigint AS count FROM search_managed_tables WHERE is_default = TRUE`
@@ -1000,6 +1401,48 @@ export class AdminService {
       'Phase 1 managed registration for existing NamuWiki documents.',
       Number(defaultCountRow?.count ?? 0) === 0
     )
+  }
+
+  private async ensureManagedTableStatusRows(): Promise<void> {
+    const tableNames = await this.listAllManagedTableNames()
+
+    for (const tableName of tableNames) {
+      await this.ensureManagedTableStatusRow(tableName)
+    }
+  }
+
+  private async ensureManagedTableStatusRow(tableName: string): Promise<void> {
+    await this.exec(
+      `
+        INSERT INTO search_managed_table_status (table_name)
+        VALUES ($1)
+        ON CONFLICT (table_name) DO NOTHING
+      `,
+      tableName
+    )
+  }
+
+  private async listAllManagedTableNames(): Promise<string[]> {
+    const rows = await this.query<{ table_name: string }>(
+      `SELECT table_name FROM search_managed_tables WHERE is_active = TRUE ORDER BY table_name ASC`
+    )
+
+    return rows.map((row) => row.table_name)
+  }
+
+  private async listManagedTableNamesForLanguage(language: string): Promise<string[]> {
+    const rows = await this.query<{ table_name: string }>(
+      `
+        SELECT table_name
+        FROM search_managed_tables
+        WHERE language = $1
+          AND is_active = TRUE
+        ORDER BY table_name ASC
+      `,
+      language
+    )
+
+    return rows.map((row) => row.table_name)
   }
 
   private async prepareRegistrationConfig(
@@ -1057,7 +1500,6 @@ export class AdminService {
       reductionMethod: merged.reductionMethod.trim() || DEFAULT_REDUCTION_METHOD,
       description:
         merged.description === null ? null : merged.description.trim() || null,
-      initializeData: merged.initializeData,
       makeDefault:
         request.makeDefault ?? existingConfig?.isDefault ?? tableName === 'namuwiki_documents'
     }
@@ -1111,6 +1553,205 @@ export class AdminService {
       reductionMethod: row.reduction_method,
       description: row.description,
       isDefault: Boolean(row.is_default)
+    }
+  }
+
+  private async refreshManagedTableStatuses(tableNames: string[]): Promise<void> {
+    for (const tableName of tableNames) {
+      await this.refreshManagedTableStatus(tableName)
+    }
+  }
+
+  private async countRowsNeedingBackfill(
+    config: ManagedTableRow,
+    includeFullSnapshot: boolean
+  ): Promise<number> {
+    const tableSql = this.quoteIdentifier(config.table_name)
+    const idColumnSql = this.quoteIdentifier(config.id_column)
+    const ftsColumnSql = this.quoteIdentifier(config.fts_column)
+    const textlenColumnSql = this.quoteIdentifier(config.textlen_column)
+    const embeddingHnswColumnSql = this.quoteIdentifier(config.embedding_hnsw_column)
+    const whereClause = includeFullSnapshot
+      ? `${idColumnSql} IS NOT NULL`
+      : `${idColumnSql} IS NOT NULL
+          AND (
+            ${embeddingHnswColumnSql} IS NULL OR
+            ${ftsColumnSql} IS NULL OR
+            ${textlenColumnSql} IS NULL
+          )`
+    const [row] = await this.query<CountRow>(
+      `
+        SELECT COUNT(*)::bigint AS count
+        FROM ${tableSql}
+        WHERE ${whereClause}
+      `
+    )
+
+    return Number(row?.count ?? 0)
+  }
+
+  private async refreshManagedTableStatus(tableName: string): Promise<void> {
+    const config = await this.getManagedTableRowOrThrow(tableName)
+    await this.ensureManagedTableStatusRow(config.table_name)
+
+    const tableSql = this.quoteIdentifier(config.table_name)
+    const embeddingHnswColumnSql = this.quoteIdentifier(config.embedding_hnsw_column)
+    const ftsColumnSql = this.quoteIdentifier(config.fts_column)
+    const textlenColumnSql = this.quoteIdentifier(config.textlen_column)
+    const [countsRow] = await this.query<{
+      row_count: bigint | number
+      embedding_count: bigint | number
+      fts_count: bigint | number
+    }>(
+      `
+        SELECT
+          COUNT(*)::bigint AS row_count,
+          COUNT(*) FILTER (WHERE ${embeddingHnswColumnSql} IS NOT NULL)::bigint AS embedding_count,
+          COUNT(*) FILTER (WHERE ${ftsColumnSql} IS NOT NULL AND ${textlenColumnSql} IS NOT NULL)::bigint AS fts_count
+        FROM ${tableSql}
+      `
+    )
+
+    const rowCount = Number(countsRow?.row_count ?? 0)
+    const embeddingCount = Number(countsRow?.embedding_count ?? 0)
+    const ftsCount = Number(countsRow?.fts_count ?? 0)
+    const embeddingCoverage = rowCount === 0 ? 1 : embeddingCount / rowCount
+    const ftsCoverage = rowCount === 0 ? 1 : ftsCount / rowCount
+    const embeddingReady = embeddingCoverage >= 1
+    const ftsReady = ftsCoverage >= 1
+    const bm25Ready = await this.isBm25ReadyForTable(config.table_name)
+    const searchEligible = embeddingReady && ftsReady && bm25Ready
+
+    await this.exec(
+      `
+        UPDATE search_managed_table_status
+        SET
+          row_count = $2,
+          embedding_coverage = $3,
+          fts_coverage = $4,
+          embedding_ready = $5,
+          fts_ready = $6,
+          bm25_ready = $7,
+          search_eligible = $8,
+          updated_at = NOW()
+        WHERE table_name = $1
+      `,
+      config.table_name,
+      rowCount,
+      Number(embeddingCoverage.toFixed(6)),
+      Number(ftsCoverage.toFixed(6)),
+      embeddingReady,
+      ftsReady,
+      bm25Ready,
+      searchEligible
+    )
+  }
+
+  private async isBm25ReadyForTable(tableName: string): Promise<boolean> {
+    const config = await this.getManagedTableRowOrThrow(tableName)
+    const supportedLanguage = await this.getSupportedLanguage(config.language)
+
+    if (!supportedLanguage) {
+      return false
+    }
+
+    const lengthTable = this.quoteIdentifier(`bm25length_${supportedLanguage.table_suffix}`)
+    const taskTable = this.quoteIdentifier(`bm25tasks_${supportedLanguage.table_suffix}`)
+    const [lengthRow] = await this.query<TableBm25LengthRow>(
+      `SELECT recordcount FROM ${lengthTable} WHERE tablename = $1`,
+      config.table_name
+    )
+    const [queueRow] = await this.query<TableBm25QueueRow>(
+      `
+        SELECT
+          COUNT(*) FILTER (WHERE status = 0)::bigint AS pending,
+          COUNT(*) FILTER (WHERE status = 1)::bigint AS in_progress
+        FROM ${taskTable}
+        WHERE table_name = $1
+      `,
+      config.table_name
+    )
+    const rowCount = await this.getTableRowCount(config.table_name)
+    const pending = Number(queueRow?.pending ?? 0)
+    const inProgress = Number(queueRow?.in_progress ?? 0)
+    const indexedCount = Number(lengthRow?.recordcount ?? 0)
+
+    if (rowCount === 0) {
+      return pending === 0 && inProgress === 0
+    }
+
+    return pending === 0 && inProgress === 0 && indexedCount === rowCount
+  }
+
+  private async reconcileDefaultManagedTables(
+    preferredTableName?: string
+  ): Promise<void> {
+    const rows = await this.query<{
+      table_name: string
+      is_default: boolean
+      search_eligible: boolean
+    }>(
+      `
+        SELECT
+          mt.table_name,
+          mt.is_default,
+          COALESCE(status.search_eligible, FALSE) AS search_eligible
+        FROM search_managed_tables mt
+        LEFT JOIN search_managed_table_status status
+          ON status.table_name = mt.table_name
+        WHERE mt.is_active = TRUE
+        ORDER BY mt.table_name ASC
+      `
+    )
+
+    const preferredEligible = preferredTableName
+      ? rows.find(
+          (row) => row.table_name === preferredTableName && row.search_eligible
+        )
+      : undefined
+    const currentEligibleDefault = rows.find(
+      (row) => row.is_default && row.search_eligible
+    )
+    const fallbackEligible =
+      rows.find(
+        (row) => row.table_name === 'namuwiki_documents' && row.search_eligible
+      ) ?? rows.find((row) => row.search_eligible)
+
+    const nextDefaultTableName =
+      preferredEligible?.table_name ??
+      currentEligibleDefault?.table_name ??
+      fallbackEligible?.table_name ??
+      null
+
+    await this.exec(`UPDATE search_managed_tables SET is_default = FALSE WHERE is_default = TRUE`)
+
+    if (nextDefaultTableName) {
+      await this.exec(
+        `UPDATE search_managed_tables SET is_default = TRUE WHERE table_name = $1`,
+        nextDefaultTableName
+      )
+    }
+  }
+
+  private mapBackfillStatusRow(row: ManagedTableStatusRow): ManagedTableBackfillStatus {
+    const totalRows = Number(row.backfill_total_rows ?? 0)
+    const processedRows = Number(row.backfill_processed_rows ?? 0)
+
+    return {
+      tableName: row.table_name,
+      status: row.backfill_status,
+      totalRows,
+      processedRows,
+      remainingRows: Math.max(totalRows - processedRows, 0),
+      lastProcessedId:
+        row.backfill_last_processed_id === null ||
+        row.backfill_last_processed_id === undefined
+          ? null
+          : Number(row.backfill_last_processed_id),
+      cancelRequested: Boolean(row.backfill_cancel_requested),
+      lastStartedAt: row.backfill_last_started_at?.toISOString() ?? null,
+      lastCompletedAt: row.backfill_last_completed_at?.toISOString() ?? null,
+      lastError: row.backfill_last_error
     }
   }
 
@@ -1168,13 +1809,12 @@ export class AdminService {
           embedding_hnsw_dim,
           reduction_method,
           description,
-          is_default,
           is_active,
           updated_at
         )
         VALUES (
           $1, $2, $3, $4, $5, $6, $7, $8, $9,
-          $10, $11, $12, $13, $14, $15, TRUE, NOW()
+          $10, $11, $12, $13, $14, TRUE, NOW()
         )
         ON CONFLICT (table_name)
         DO UPDATE SET
@@ -1191,7 +1831,6 @@ export class AdminService {
           embedding_hnsw_dim = EXCLUDED.embedding_hnsw_dim,
           reduction_method = EXCLUDED.reduction_method,
           description = EXCLUDED.description,
-          is_default = EXCLUDED.is_default,
           is_active = EXCLUDED.is_active,
           updated_at = NOW()
       `,
@@ -1208,8 +1847,7 @@ export class AdminService {
       config.embeddingDim,
       config.embeddingHnswDim,
       config.reductionMethod,
-      config.description,
-      config.makeDefault
+      config.description
     )
   }
 
@@ -1343,6 +1981,190 @@ export class AdminService {
       `UPDATE search_bm25_language_settings SET last_indexed_at = NOW(), updated_at = NOW() WHERE language = $1`,
       language
     )
+  }
+
+  private async loadBackfillChunk(
+    config: ManagedTableRow,
+    lastProcessedId: number | null,
+    chunkSize: number,
+    includeFullSnapshot: boolean
+  ): Promise<TableBackfillChunkRow[]> {
+    const tableSql = this.quoteIdentifier(config.table_name)
+    const idColumnSql = this.quoteIdentifier(config.id_column)
+    const titleColumnSql = this.quoteIdentifier(config.title_column)
+    const contentColumnSql = this.quoteIdentifier(config.content_column)
+    const textlenColumnSql = this.quoteIdentifier(config.textlen_column)
+    const ftsColumnSql = this.quoteIdentifier(config.fts_column)
+    const embeddingColumnSql = this.quoteIdentifier(config.embedding_column)
+    const embeddingHnswColumnSql = this.quoteIdentifier(config.embedding_hnsw_column)
+    const docHashSelect = config.doc_hash_column
+      ? `d.${this.quoteIdentifier(config.doc_hash_column)} AS "docHash",`
+      : `NULL::text AS "docHash",`
+    const legacyJoin =
+      config.table_name === 'namuwiki_documents' &&
+      config.doc_hash_column === 'doc_hash' &&
+      (await this.tableExists('namuwiki_document_embeddings_qwen'))
+        ? `LEFT JOIN namuwiki_document_embeddings_qwen legacy ON legacy.doc_hash = d.${this.quoteIdentifier(config.doc_hash_column)}`
+        : ''
+    const needsWorkClause = includeFullSnapshot
+      ? 'TRUE'
+      : `(
+            ${embeddingHnswColumnSql} IS NULL OR
+            ${ftsColumnSql} IS NULL OR
+            ${textlenColumnSql} IS NULL
+          )`
+
+    return this.query<TableBackfillChunkRow>(
+      `
+        SELECT
+          d.${idColumnSql} AS id,
+          ${docHashSelect}
+          d.${titleColumnSql} AS title,
+          d.${contentColumnSql} AS content,
+          d.${textlenColumnSql} AS textlen,
+          d.${ftsColumnSql}::text AS "ftsText",
+          d.${embeddingColumnSql}::text AS "embeddingText",
+          d.${embeddingHnswColumnSql}::text AS "embeddingHnswText",
+          ${legacyJoin ? 'legacy.embedding::text' : 'NULL::text'} AS "legacyEmbeddingText"
+        FROM ${tableSql} d
+        ${legacyJoin}
+        WHERE d.${idColumnSql} > $1
+          AND ${needsWorkClause}
+        ORDER BY d.${idColumnSql} ASC
+        LIMIT $2
+      `,
+      lastProcessedId ?? 0,
+      chunkSize
+    )
+  }
+
+  private async processBackfillChunk(
+    config: ManagedTableRow,
+    rows: TableBackfillChunkRow[],
+    queueBm25Snapshot: boolean
+  ): Promise<TableBackfillChunkRow[]> {
+    if (rows.length === 0) {
+      return rows
+    }
+
+    await this.prismaService.$transaction(async (tx) => {
+      const tableSql = this.quoteIdentifier(config.table_name)
+      const idColumnSql = this.quoteIdentifier(config.id_column)
+      const titleColumnSql = this.quoteIdentifier(config.title_column)
+      const contentColumnSql = this.quoteIdentifier(config.content_column)
+      const textlenColumnSql = this.quoteIdentifier(config.textlen_column)
+      const ftsColumnSql = this.quoteIdentifier(config.fts_column)
+      const embeddingHnswColumnSql = this.quoteIdentifier(config.embedding_hnsw_column)
+
+      for (const row of rows) {
+        const nextTitle = row.title ?? null
+        const nextContent = row.content
+        const nextFtsPayload =
+          row.ftsText === null || row.textlen === null
+            ? await this.computeFtsPayload(config.language, nextTitle, nextContent, tx)
+            : {
+                ftsText: row.ftsText,
+                textlen: row.textlen
+              }
+        const nextEmbeddingHnsw =
+          row.embeddingHnswText ??
+          this.deriveBackfillEmbeddingHnswText(
+            row.embeddingText,
+            row.legacyEmbeddingText,
+            config.embedding_dim,
+            config.embedding_hnsw_dim
+          )
+
+        const updates: string[] = []
+        const params: unknown[] = []
+
+        if (row.ftsText === null) {
+          params.push(nextFtsPayload.ftsText)
+          updates.push(`${ftsColumnSql} = $${params.length}::tsvector`)
+        }
+
+        if (row.textlen === null) {
+          params.push(nextFtsPayload.textlen)
+          updates.push(`${textlenColumnSql} = $${params.length}`)
+        }
+
+        if (row.embeddingHnswText === null && nextEmbeddingHnsw !== null) {
+          params.push(nextEmbeddingHnsw)
+          updates.push(`${embeddingHnswColumnSql} = $${params.length}::vector`)
+        }
+
+        if (updates.length > 0) {
+          params.push(Number(row.id))
+          await this.exec(
+            `
+              UPDATE ${tableSql}
+              SET ${updates.join(', ')}
+              WHERE ${idColumnSql} = $${params.length}
+            `,
+            tx,
+            ...params
+          )
+        }
+
+        const shouldQueueBm25 =
+          queueBm25Snapshot ||
+          row.ftsText === null ||
+          row.textlen === null
+
+        if (shouldQueueBm25) {
+          await this.enqueueTask(
+            config.language,
+            {
+              taskType: 0,
+              tableName: config.table_name,
+              id: Number(row.id),
+              oldLen: null,
+              oldFtsText: null,
+              newLen: nextFtsPayload.textlen,
+              newFtsText: nextFtsPayload.ftsText
+            },
+            tx
+          )
+        }
+      }
+    })
+
+    return rows
+  }
+
+  private deriveBackfillEmbeddingHnswText(
+    embeddingText: string | null,
+    legacyEmbeddingText: string | null,
+    embeddingDim: number,
+    embeddingHnswDim: number
+  ): string | null {
+    const source = embeddingText ?? legacyEmbeddingText
+
+    if (!source) {
+      return null
+    }
+
+    const vector = this.parseVectorLiteral(source)
+
+    if (vector.length === 0) {
+      return null
+    }
+
+    const expectedSourceDim = embeddingDim > 0 ? embeddingDim : vector.length
+    if (vector.length !== expectedSourceDim && vector.length !== embeddingHnswDim) {
+      return null
+    }
+
+    const nextVector =
+      vector.length === embeddingHnswDim
+        ? vector
+        : vector.slice(0, embeddingHnswDim)
+
+    if (nextVector.length !== embeddingHnswDim) {
+      return null
+    }
+
+    return this.toVectorLiteral(nextVector, embeddingHnswDim, 'embeddingHnsw')
   }
 
   private async getManagedTableRowOrThrow(
@@ -1690,6 +2512,66 @@ export class AdminService {
     return Number(row?.count ?? 0)
   }
 
+  private assertEmbeddingPayloadPresent(
+    request: ManagedDocumentUpsertRequest
+  ): void {
+    if (!request.embedding && !request.embeddingHnsw) {
+      throw new Error('embedding or embeddingHnsw must be provided')
+    }
+  }
+
+  private resolveEmbeddingHnswLiteral(
+    embeddingHnswDim: number,
+    embeddingHnsw: number[] | null | undefined,
+    embedding: number[] | null | undefined,
+    embeddingDim: number
+  ): string | null | undefined {
+    if (embeddingHnsw !== undefined) {
+      if (embeddingHnsw === null) {
+        return null
+      }
+
+      return this.toVectorLiteral(embeddingHnsw, embeddingHnswDim, 'embeddingHnsw')
+    }
+
+    if (embedding === undefined) {
+      return undefined
+    }
+
+    if (embedding === null) {
+      return null
+    }
+
+    if (embeddingDim < embeddingHnswDim) {
+      throw new Error('embedding dimension cannot be smaller than embeddingHnsw dimension')
+    }
+
+    const nextVector =
+      embedding.length === embeddingHnswDim
+        ? embedding
+        : embedding.slice(0, embeddingHnswDim)
+
+    return this.toVectorLiteral(nextVector, embeddingHnswDim, 'embeddingHnsw')
+  }
+
+  private parseVectorLiteral(vectorLiteral: string): number[] {
+    const trimmed = vectorLiteral.trim()
+
+    if (!trimmed.startsWith('[') || !trimmed.endsWith(']')) {
+      return []
+    }
+
+    if (trimmed === '[]') {
+      return []
+    }
+
+    return trimmed
+      .slice(1, -1)
+      .split(',')
+      .map((value) => Number(value.trim()))
+      .filter((value) => Number.isFinite(value))
+  }
+
   private toVectorLiteral(
     vector: number[],
     expectedDim: number,
@@ -1828,8 +2710,10 @@ export class AdminService {
         SELECT language, table_suffix
         FROM search_supported_languages
         WHERE language = $1
+          AND language = ANY($2::text[])
       `,
-      language
+      language,
+      [...ENABLED_TEXT_SEARCH_LANGUAGES]
     )
 
     return row ?? null
@@ -1840,10 +2724,17 @@ export class AdminService {
       `
         SELECT language, table_suffix
         FROM search_supported_languages
-        WHERE language IN ('korean', 'simple')
-        ORDER BY CASE language WHEN 'korean' THEN 0 WHEN 'simple' THEN 1 ELSE 2 END
+        WHERE language = ANY($1::text[])
+        ORDER BY CASE language
+          WHEN 'korean' THEN 0
+          WHEN 'english' THEN 1
+          WHEN 'japanese' THEN 2
+          WHEN 'chinese' THEN 3
+          ELSE 4
+        END
         LIMIT 1
-      `
+      `,
+      [...ENABLED_TEXT_SEARCH_LANGUAGES]
     )
 
     if (preferred) {
@@ -1851,10 +2742,17 @@ export class AdminService {
     }
 
     const [fallback] = await this.query<SupportedLanguageRow>(
-      `SELECT language, table_suffix FROM search_supported_languages ORDER BY language ASC LIMIT 1`
+      `
+        SELECT language, table_suffix
+        FROM search_supported_languages
+        WHERE language = ANY($1::text[])
+        ORDER BY language ASC
+        LIMIT 1
+      `,
+      [...ENABLED_TEXT_SEARCH_LANGUAGES]
     )
 
-    return fallback?.language ?? 'simple'
+    return fallback?.language ?? 'korean'
   }
 
   private async tableExists(tableName: string): Promise<boolean> {
@@ -1905,6 +2803,14 @@ export class AdminService {
 
   private normalizeLanguage(language: string): string {
     return language.trim().toLowerCase()
+  }
+
+  private describeError(error: unknown): string {
+    if (error instanceof Error) {
+      return error.message
+    }
+
+    return typeof error === 'string' ? error : 'unknown-error'
   }
 
   private ensureSafeIdentifier(identifier: string): string {

@@ -115,6 +115,26 @@ CREATE TABLE IF NOT EXISTS search_managed_tables (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS search_managed_table_status (
+    table_name TEXT PRIMARY KEY REFERENCES search_managed_tables(table_name) ON DELETE CASCADE,
+    row_count BIGINT NOT NULL DEFAULT 0,
+    embedding_coverage DOUBLE PRECISION NOT NULL DEFAULT 0,
+    fts_coverage DOUBLE PRECISION NOT NULL DEFAULT 0,
+    embedding_ready BOOLEAN NOT NULL DEFAULT FALSE,
+    fts_ready BOOLEAN NOT NULL DEFAULT FALSE,
+    bm25_ready BOOLEAN NOT NULL DEFAULT FALSE,
+    search_eligible BOOLEAN NOT NULL DEFAULT FALSE,
+    backfill_status TEXT NOT NULL DEFAULT 'idle',
+    backfill_total_rows BIGINT NOT NULL DEFAULT 0,
+    backfill_processed_rows BIGINT NOT NULL DEFAULT 0,
+    backfill_last_processed_id BIGINT,
+    backfill_cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
+    backfill_last_started_at TIMESTAMPTZ,
+    backfill_last_completed_at TIMESTAMPTZ,
+    backfill_last_error TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_search_managed_tables_default
     ON search_managed_tables ((is_default))
     WHERE is_default = TRUE;
@@ -153,6 +173,7 @@ BEGIN
     FOR config_record IN
         SELECT cfgname
         FROM pg_ts_config
+        WHERE cfgname IN ('english', 'korean', 'japanese', 'chinese')
         ORDER BY cfgname ASC
     LOOP
         normalized_suffix := COALESCE(

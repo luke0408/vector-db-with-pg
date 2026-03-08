@@ -1,5 +1,7 @@
 .DS_Store
 .env
+.env.*
+!.env.example
 
 pgadmin/data/
 pgvector/data/
@@ -17,4 +19,5 @@ tmp/
 data/*.parquet
 data/
 infra/db/data/
-.artifacts/search-latency/
+.artifacts/
+.codex/

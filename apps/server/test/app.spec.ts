@@ -13,6 +13,25 @@ const queryEmbeddingServiceMock = {
   getHealthStatus: jest.fn()
 }
 
+function managedSearchContextRow(overrides: Record<string, unknown> = {}) {
+  return {
+    table_name: 'namuwiki_documents',
+    language: 'korean',
+    id_column: 'id',
+    doc_hash_column: 'doc_hash',
+    title_column: 'title',
+    content_column: 'content',
+    textlen_column: 'textlen',
+    fts_column: 'fts',
+    embedding_column: 'embedding_qwen',
+    embedding_hnsw_column: 'embedding_hnsw',
+    table_suffix: 'korean',
+    k1: 1.2,
+    b: 0.75,
+    ...overrides
+  }
+}
+
 async function createTestingModule(): Promise<TestingModule> {
   return Test.createTestingModule({
     controllers: [AppController],
@@ -99,6 +118,7 @@ describe('AppController', () => {
 
   it('returns search envelope with execution plan by default', async () => {
     prismaServiceMock.$queryRawUnsafe
+      .mockResolvedValueOnce([managedSearchContextRow()])
       .mockResolvedValueOnce([
         {
           id: BigInt(1),
@@ -148,6 +168,7 @@ describe('AppController', () => {
   it('omits execution plan when explain mode is explicitly disabled', async () => {
     process.env.SEARCH_INCLUDE_EXPLAIN = 'false'
     prismaServiceMock.$queryRawUnsafe
+      .mockResolvedValueOnce([managedSearchContextRow()])
       .mockResolvedValueOnce([
         {
           id: BigInt(1),
@@ -175,7 +196,7 @@ describe('AppController', () => {
 
     expect(response.success).toBe(false)
     expect(response.data).toEqual([])
-    expect(response.error).toBe('embeddingModel must be one of base, qwen3')
+    expect(response.error).toBe('embeddingModel must be qwen3')
   })
 
   it('returns validation error envelope for empty query', async () => {
@@ -190,6 +211,7 @@ describe('AppController', () => {
 
   it('returns hybrid search envelope using runtime query embeddings with execution plan by default', async () => {
     prismaServiceMock.$queryRawUnsafe
+      .mockResolvedValueOnce([managedSearchContextRow()])
       .mockResolvedValueOnce([{ available: true }])
       .mockResolvedValueOnce([
         {
@@ -209,7 +231,7 @@ describe('AppController', () => {
             {
               Plan: {
                 'Node Type': 'Limit',
-                'Relation Name': 'namuwiki_document_embeddings_qwen',
+                'Relation Name': 'namuwiki_documents',
                 'Total Cost': 20,
                 'Plan Rows': 1
               }
@@ -266,6 +288,7 @@ describe('AppController', () => {
   it('omits hybrid execution plan when explain mode is explicitly disabled', async () => {
     process.env.SEARCH_INCLUDE_EXPLAIN = 'false'
     prismaServiceMock.$queryRawUnsafe
+      .mockResolvedValueOnce([managedSearchContextRow()])
       .mockResolvedValueOnce([{ available: true }])
       .mockResolvedValueOnce([
         {
@@ -301,6 +324,7 @@ describe('AppController', () => {
       reason: 'query-embedding-unavailable'
     })
     prismaServiceMock.$queryRawUnsafe
+      .mockResolvedValueOnce([managedSearchContextRow()])
       .mockResolvedValueOnce([{ available: true }])
       .mockResolvedValueOnce([
         {
@@ -360,6 +384,7 @@ describe('AppController', () => {
 
   it('falls back to lexical BM25 when the selected embedding store is empty', async () => {
     prismaServiceMock.$queryRawUnsafe
+      .mockResolvedValueOnce([managedSearchContextRow()])
       .mockResolvedValueOnce([{ available: false }])
       .mockResolvedValueOnce([
         {
@@ -399,7 +424,7 @@ describe('AppController', () => {
       mode: 'ivf',
       bm25Enabled: true,
       hybridRatio: 60,
-      embeddingModel: 'base'
+      embeddingModel: 'qwen3'
     })
 
     expect(queryEmbeddingServiceMock.embedQuery).not.toHaveBeenCalled()
@@ -413,6 +438,7 @@ describe('AppController', () => {
 
   it('falls back to lexical BM25 when ANN returns no candidates', async () => {
     prismaServiceMock.$queryRawUnsafe
+      .mockResolvedValueOnce([managedSearchContextRow()])
       .mockResolvedValueOnce([{ available: true }])
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([{ total: BigInt(0) }])
@@ -422,7 +448,7 @@ describe('AppController', () => {
             {
               Plan: {
                 'Node Type': 'Limit',
-                'Relation Name': 'namuwiki_document_embeddings_qwen',
+                'Relation Name': 'namuwiki_documents',
                 'Total Cost': 20,
                 'Plan Rows': 0
               }
@@ -481,6 +507,7 @@ describe('AppController', () => {
 
   it('falls back to lexical BM25 when ANN signal is weak for long natural language queries', async () => {
     prismaServiceMock.$queryRawUnsafe
+      .mockResolvedValueOnce([managedSearchContextRow()])
       .mockResolvedValueOnce([{ available: true }])
       .mockResolvedValueOnce([
         {
@@ -500,7 +527,7 @@ describe('AppController', () => {
             {
               Plan: {
                 'Node Type': 'Limit',
-                'Relation Name': 'namuwiki_document_embeddings_qwen',
+                'Relation Name': 'namuwiki_documents',
                 'Total Cost': 20,
                 'Plan Rows': 1
               }
@@ -562,7 +589,9 @@ describe('AppController', () => {
       reason: 'query-embedding-timeout'
     })
     prismaServiceMock.$queryRawUnsafe
+      .mockResolvedValueOnce([managedSearchContextRow()])
       .mockResolvedValueOnce([{ available: true }])
+      .mockResolvedValueOnce([managedSearchContextRow()])
       .mockResolvedValueOnce([
         {
           id: BigInt(12),
@@ -610,6 +639,7 @@ describe('AppController', () => {
 
   it('returns selected embedding model in meta for hybrid search', async () => {
     prismaServiceMock.$queryRawUnsafe
+      .mockResolvedValueOnce([managedSearchContextRow()])
       .mockResolvedValueOnce([{ available: true }])
       .mockResolvedValueOnce([
         {
@@ -664,6 +694,6 @@ describe('AppController', () => {
     })
 
     expect(response.success).toBe(false)
-    expect(response.error).toBe('embeddingModel must be one of base, qwen3')
+    expect(response.error).toBe('embeddingModel must be qwen3')
   })
 })

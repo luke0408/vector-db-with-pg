@@ -43,7 +43,7 @@ export interface SearchMeta {
   limit: number
   tookMs?: number
   requestId?: string
-  embeddingModelUsed?: 'base' | 'qwen3'
+  embeddingModelUsed?: 'qwen3'
   tableNameUsed?: string
   languageUsed?: string
 }
@@ -63,7 +63,7 @@ export interface SearchRequestOptions {
   mode?: 'none' | 'hnsw' | 'ivf'
   bm25Enabled?: boolean
   hybridRatio?: number
-  embeddingModel?: 'base' | 'qwen3'
+  embeddingModel?: 'qwen3'
 }
 
 export interface ManagedLanguageSummary {
@@ -99,6 +99,13 @@ export interface ManagedTableSummary {
   isActive: boolean
   rowCount: number
   lastIndexedAt: string | null
+  embeddingCoverage: number
+  ftsCoverage: number
+  embeddingReady: boolean
+  ftsReady: boolean
+  bm25Ready: boolean
+  searchEligible: boolean
+  backfill: ManagedTableBackfillStatus
 }
 
 export interface Bm25LanguageStatus {
@@ -144,19 +151,54 @@ export interface Bm25IndexingEvent {
 export interface RegisterExistingTableRequest {
   tableName: string
   language?: string
-  initializeData?: boolean
   makeDefault?: boolean
 }
 
 export interface RegisterExistingTableResult {
   table: ManagedTableSummary
-  initializedData: boolean
   bm25LanguageStatus: Bm25LanguageStatus
+}
+
+export type ManagedTableBackfillState =
+  | 'idle'
+  | 'running'
+  | 'completed'
+  | 'cancelled'
+  | 'error'
+
+export interface ManagedTableBackfillStatus {
+  tableName: string
+  status: ManagedTableBackfillState
+  totalRows: number
+  processedRows: number
+  remainingRows: number
+  lastProcessedId: number | null
+  cancelRequested: boolean
+  lastStartedAt: string | null
+  lastCompletedAt: string | null
+  lastError: string | null
+}
+
+export interface ManagedTableBackfillEvent {
+  event: 'started' | 'chunk' | 'completed' | 'cancelled' | 'error'
+  tableName: string
+  chunkSize: number
+  processedRows?: number
+  remainingRows?: number
+  updatedRows?: number
+  elapsedMs?: number
+  message?: string
 }
 
 export interface Bm25IndexingStreamOptions {
   chunkSize: number
   onEvent: (event: Bm25IndexingEvent) => void
+  signal?: AbortSignal
+}
+
+export interface ManagedTableBackfillStreamOptions {
+  chunkSize: number
+  onEvent: (event: ManagedTableBackfillEvent) => void
   signal?: AbortSignal
 }
 
@@ -218,6 +260,36 @@ export async function registerExistingTable(
   )
 }
 
+export async function getManagedTableBackfillStatus(
+  tableName: string
+): Promise<ApiEnvelope<ManagedTableBackfillStatus>> {
+  return requestJson<ApiEnvelope<ManagedTableBackfillStatus>>(
+    `/api/admin/tables/${encodeURIComponent(tableName)}/backfill/status`
+  )
+}
+
+export async function initializeManagedTableBackfill(
+  tableName: string
+): Promise<ApiEnvelope<ManagedTableBackfillStatus>> {
+  return requestJson<ApiEnvelope<ManagedTableBackfillStatus>>(
+    `/api/admin/tables/${encodeURIComponent(tableName)}/backfill`,
+    {
+      method: 'POST'
+    }
+  )
+}
+
+export async function cancelManagedTableBackfill(
+  tableName: string
+): Promise<ApiEnvelope<ManagedTableBackfillStatus>> {
+  return requestJson<ApiEnvelope<ManagedTableBackfillStatus>>(
+    `/api/admin/tables/${encodeURIComponent(tableName)}/backfill/cancel`,
+    {
+      method: 'POST'
+    }
+  )
+}
+
 export async function updateBm25Settings(
   language: string,
   payload: Bm25SettingsUpdateRequest
@@ -249,6 +321,44 @@ export async function runBm25IndexingStream(
 
   if (!response.body) {
     throw new Error('Indexing response did not include a stream body')
+  }
+
+  await consumeEventStream(response, (event) => {
+    options.onEvent(event as Bm25IndexingEvent)
+  })
+}
+
+export async function runManagedTableBackfillStream(
+  tableName: string,
+  options: ManagedTableBackfillStreamOptions
+): Promise<void> {
+  const response = await fetch(
+    `${SERVER_BASE_URL}/api/admin/tables/${encodeURIComponent(tableName)}/backfill/run?chunkSize=${encodeURIComponent(String(options.chunkSize))}`,
+    {
+      method: 'GET',
+      signal: options.signal
+    }
+  )
+
+  if (!response.ok) {
+    throw new Error(`Backfill request failed with status ${response.status}`)
+  }
+
+  if (!response.body) {
+    throw new Error('Backfill response did not include a stream body')
+  }
+
+  await consumeEventStream(response, (event) => {
+    options.onEvent(event as ManagedTableBackfillEvent)
+  })
+}
+
+async function consumeEventStream(
+  response: Response,
+  onEvent: (event: { event?: string }) => void
+): Promise<void> {
+  if (!response.body) {
+    throw new Error('Streaming response did not include a body')
   }
 
   const reader = response.body.getReader()
@@ -289,9 +399,9 @@ export async function runBm25IndexingStream(
       }
 
       const parsed = JSON.parse(data) as Bm25IndexingEvent
-      options.onEvent({
+      onEvent({
         ...parsed,
-        event: (parsed.event ?? pendingEventName) as Bm25IndexingEvent['event']
+        event: parsed.event ?? pendingEventName
       })
     }
   }

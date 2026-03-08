@@ -916,26 +916,6 @@ export class AppService {
   ): Promise<ManagedSearchContext> {
     const normalizedTableName = tableName?.trim()
 
-    if (!normalizedTableName || normalizedTableName === 'namuwiki_documents') {
-      return {
-        tableName: 'namuwiki_documents',
-        language: 'korean',
-        tableSuffix: 'korean',
-        idColumn: 'id',
-        docHashColumn: 'doc_hash',
-        titleColumn: 'title',
-        contentColumn: 'content',
-        textlenColumn: 'textlen',
-        ftsColumn: 'fts',
-        embeddingColumn: 'embedding_qwen',
-        embeddingHnswColumn: 'embedding_hnsw',
-        k1: 1.2,
-        b: 0.75,
-        supportsLegacyNamespace: true,
-        supportsLegacyContributors: true
-      }
-    }
-
     const rows = await this.prismaService.$queryRawUnsafe(
       `
         SELECT
@@ -957,11 +937,18 @@ export class AppService {
           ON sl.language = mt.language
         LEFT JOIN search_bm25_language_settings settings
           ON settings.language = mt.language
-        WHERE mt.table_name = $1
-          AND mt.is_active = TRUE
+        LEFT JOIN search_managed_table_status status
+          ON status.table_name = mt.table_name
+        WHERE mt.is_active = TRUE
+          AND COALESCE(status.search_eligible, FALSE) = TRUE
+          AND (
+            ($1::text IS NULL AND mt.is_default = TRUE) OR
+            mt.table_name = COALESCE($1::text, mt.table_name)
+          )
+        ORDER BY mt.is_default DESC, mt.table_name ASC
         LIMIT 1
       `,
-      normalizedTableName
+      normalizedTableName ?? null
     ) as Array<{
       table_name: string
       language: string
@@ -981,7 +968,11 @@ export class AppService {
     const row = rows[0]
 
     if (!row) {
-      throw new Error(`Managed table not found: ${normalizedTableName}`)
+      if (normalizedTableName) {
+        throw new Error(`Managed table is not search eligible: ${normalizedTableName}`)
+      }
+
+      throw new Error('No search-eligible managed table is configured')
     }
 
     return {
@@ -998,8 +989,8 @@ export class AppService {
       embeddingHnswColumn: row.embedding_hnsw_column,
       k1: Number(row.k1),
       b: Number(row.b),
-      supportsLegacyNamespace: false,
-      supportsLegacyContributors: false
+      supportsLegacyNamespace: row.table_name === 'namuwiki_documents',
+      supportsLegacyContributors: row.table_name === 'namuwiki_documents'
     }
   }
 
@@ -1022,28 +1013,11 @@ export class AppService {
 
   private buildHybridSourceJoin(tableContext: ManagedSearchContext): string {
     const tableSql = this.quoteIdentifier(tableContext.tableName)
-
-    if (
-      tableContext.tableName === 'namuwiki_documents' &&
-      tableContext.docHashColumn === 'doc_hash'
-    ) {
-      return `${tableSql} d LEFT JOIN namuwiki_document_embeddings_qwen legacy ON legacy.doc_hash = d.${this.quoteIdentifier(tableContext.docHashColumn)}`
-    }
-
     return `${tableSql} d`
   }
 
   private buildEmbeddingExpression(tableContext: ManagedSearchContext): string {
-    const managedEmbeddingExpr = this.columnRef('d', tableContext.embeddingHnswColumn)
-
-    if (
-      tableContext.tableName === 'namuwiki_documents' &&
-      tableContext.docHashColumn === 'doc_hash'
-    ) {
-      return `COALESCE(${managedEmbeddingExpr}, legacy.embedding)`
-    }
-
-    return managedEmbeddingExpr
+    return this.columnRef('d', tableContext.embeddingHnswColumn)
   }
 
   private buildSearchVectorExpression(
@@ -1054,11 +1028,6 @@ export class AppService {
     const titleColumnSql = this.columnRef(alias, tableContext.titleColumn)
     const contentColumnSql = this.columnRef(alias, tableContext.contentColumn)
     const generatedVector = `to_tsvector(${this.sqlStringLiteral(tableContext.language)}, concat_ws(' ', COALESCE(${titleColumnSql}, ''), COALESCE(${contentColumnSql}, '')))`
-
-    if (tableContext.tableName === 'namuwiki_documents') {
-      return `COALESCE(${ftsColumnSql}, ${alias}.search_vector, ${generatedVector})`
-    }
-
     return `COALESCE(${ftsColumnSql}, ${generatedVector})`
   }
 

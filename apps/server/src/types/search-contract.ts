@@ -1,7 +1,7 @@
 import type { tags } from 'typia'
 
 export type SearchMode = 'none' | 'hnsw' | 'ivf'
-export type EmbeddingModel = 'base' | 'qwen3'
+export type EmbeddingModel = 'qwen3'
 
 export interface SearchRequest {
   query: string & tags.MinLength<1> & tags.MaxLength<200>

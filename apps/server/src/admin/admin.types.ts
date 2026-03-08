@@ -31,6 +31,13 @@ export interface ManagedTableSummary {
   isActive: boolean
   rowCount: number
   lastIndexedAt: string | null
+  embeddingCoverage: number
+  ftsCoverage: number
+  embeddingReady: boolean
+  ftsReady: boolean
+  bm25Ready: boolean
+  searchEligible: boolean
+  backfill: ManagedTableBackfillStatus
 }
 
 export interface Bm25LanguageStatus {
@@ -71,14 +78,43 @@ export interface RegisterExistingTableRequest {
   embeddingHnswDim?: number
   reductionMethod?: string
   description?: string
-  initializeData?: boolean
   makeDefault?: boolean
 }
 
 export interface RegisterExistingTableResult {
   table: ManagedTableSummary
-  initializedData: boolean
   bm25LanguageStatus: Bm25LanguageStatus
+}
+
+export type ManagedTableBackfillState =
+  | 'idle'
+  | 'running'
+  | 'completed'
+  | 'cancelled'
+  | 'error'
+
+export interface ManagedTableBackfillStatus {
+  tableName: string
+  status: ManagedTableBackfillState
+  totalRows: number
+  processedRows: number
+  remainingRows: number
+  lastProcessedId: number | null
+  cancelRequested: boolean
+  lastStartedAt: string | null
+  lastCompletedAt: string | null
+  lastError: string | null
+}
+
+export interface ManagedTableBackfillEvent {
+  event: 'started' | 'chunk' | 'completed' | 'cancelled' | 'error'
+  tableName: string
+  chunkSize: number
+  processedRows?: number
+  remainingRows?: number
+  updatedRows?: number
+  elapsedMs?: number
+  message?: string
 }
 
 export interface Bm25SettingsUpdateRequest {

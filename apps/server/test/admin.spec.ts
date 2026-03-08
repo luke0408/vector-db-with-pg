@@ -8,11 +8,15 @@ const adminServiceMock = {
   listManagedTables: jest.fn(),
   getBm25LanguageStatus: jest.fn(),
   registerExistingTable: jest.fn(),
+  prepareTableBackfill: jest.fn(),
+  getManagedTableBackfillStatus: jest.fn(),
+  cancelTableBackfill: jest.fn(),
   updateBm25Settings: jest.fn(),
   createManagedDocument: jest.fn(),
   updateManagedDocument: jest.fn(),
   deleteManagedDocument: jest.fn(),
-  runBm25Indexing: jest.fn()
+  runBm25Indexing: jest.fn(),
+  runManagedTableBackfill: jest.fn()
 }
 
 async function createTestingModule(): Promise<TestingModule> {
@@ -118,7 +122,25 @@ describe('AdminController', () => {
         isDefault: true,
         isActive: true,
         rowCount: 59008,
-        lastIndexedAt: null
+        lastIndexedAt: null,
+        embeddingCoverage: 1,
+        ftsCoverage: 1,
+        embeddingReady: true,
+        ftsReady: true,
+        bm25Ready: true,
+        searchEligible: true,
+        backfill: {
+          tableName: 'namuwiki_documents',
+          status: 'completed',
+          totalRows: 59008,
+          processedRows: 59008,
+          remainingRows: 0,
+          lastProcessedId: 59008,
+          cancelRequested: false,
+          lastStartedAt: '2026-03-08T00:00:00.000Z',
+          lastCompletedAt: '2026-03-08T00:01:00.000Z',
+          lastError: null
+        }
       }
     ])
 
@@ -200,12 +222,29 @@ describe('AdminController', () => {
         embeddingHnswDim: 1024,
         reductionMethod: 'prefix_truncation',
         description: null,
-        isDefault: true,
+        isDefault: false,
         isActive: true,
         rowCount: 59008,
-        lastIndexedAt: null
+        lastIndexedAt: null,
+        embeddingCoverage: 0,
+        ftsCoverage: 0,
+        embeddingReady: false,
+        ftsReady: false,
+        bm25Ready: false,
+        searchEligible: false,
+        backfill: {
+          tableName: 'namuwiki_documents',
+          status: 'idle',
+          totalRows: 59008,
+          processedRows: 0,
+          remainingRows: 59008,
+          lastProcessedId: null,
+          cancelRequested: false,
+          lastStartedAt: null,
+          lastCompletedAt: null,
+          lastError: null
+        }
       },
-      initializedData: true,
       bm25LanguageStatus: {
         language: 'korean',
         tableSuffix: 'korean',
@@ -235,7 +274,6 @@ describe('AdminController', () => {
     const response = await controller.registerExistingTable({
       tableName: 'namuwiki_documents',
       language: 'korean',
-      initializeData: true,
       makeDefault: true
     })
 
@@ -245,10 +283,61 @@ describe('AdminController', () => {
       expect.objectContaining({
         tableName: 'namuwiki_documents',
         language: 'korean',
-        initializeData: true,
         makeDefault: true
       })
     )
+  })
+
+  it('prepares and reads managed table backfill status', async () => {
+    const status = {
+      tableName: 'namuwiki_documents',
+      status: 'idle',
+      totalRows: 59008,
+      processedRows: 0,
+      remainingRows: 59008,
+      lastProcessedId: null,
+      cancelRequested: false,
+      lastStartedAt: null,
+      lastCompletedAt: null,
+      lastError: null
+    }
+    adminServiceMock.prepareTableBackfill.mockResolvedValueOnce(status)
+    adminServiceMock.getManagedTableBackfillStatus.mockResolvedValueOnce(status)
+
+    const moduleRef = await createTestingModule()
+    const controller = moduleRef.get(AdminController)
+
+    const prepareResponse = await controller.prepareManagedTableBackfill('namuwiki_documents')
+    const statusResponse = await controller.getManagedTableBackfillStatus('namuwiki_documents')
+
+    expect(prepareResponse.success).toBe(true)
+    expect(statusResponse.success).toBe(true)
+    expect(adminServiceMock.prepareTableBackfill).toHaveBeenCalledWith('namuwiki_documents')
+    expect(adminServiceMock.getManagedTableBackfillStatus).toHaveBeenCalledWith('namuwiki_documents')
+  })
+
+  it('cancels managed table backfill', async () => {
+    const status = {
+      tableName: 'namuwiki_documents',
+      status: 'cancelled',
+      totalRows: 59008,
+      processedRows: 500,
+      remainingRows: 58508,
+      lastProcessedId: 500,
+      cancelRequested: true,
+      lastStartedAt: '2026-03-08T00:00:00.000Z',
+      lastCompletedAt: null,
+      lastError: null
+    }
+    adminServiceMock.cancelTableBackfill.mockResolvedValueOnce(status)
+
+    const moduleRef = await createTestingModule()
+    const controller = moduleRef.get(AdminController)
+    const response = await controller.cancelManagedTableBackfill('namuwiki_documents')
+
+    expect(response.success).toBe(true)
+    expect(response.data[0]).toEqual(status)
+    expect(adminServiceMock.cancelTableBackfill).toHaveBeenCalledWith('namuwiki_documents')
   })
 
   it('updates bm25 settings', async () => {
@@ -329,7 +418,8 @@ describe('AdminController', () => {
       'namuwiki_documents',
       '77',
       {
-        content: '라이츄'
+        content: '라이츄',
+        embeddingHnsw: [0.1, 0.2]
       }
     )
 
@@ -338,7 +428,8 @@ describe('AdminController', () => {
       'namuwiki_documents',
       77,
       expect.objectContaining({
-        content: '라이츄'
+        content: '라이츄',
+        embeddingHnsw: [0.1, 0.2]
       })
     )
   })
@@ -361,6 +452,38 @@ describe('AdminController', () => {
       'namuwiki_documents',
       77
     )
+  })
+
+  it('streams managed table backfill events over sse', async () => {
+    adminServiceMock.runManagedTableBackfill.mockImplementationOnce(
+      async (
+        tableName: string,
+        chunkSize: number,
+        emit: (event: { event: string; tableName: string; chunkSize: number }) => void
+      ) => {
+        emit({ event: 'started', tableName, chunkSize })
+        emit({ event: 'completed', tableName, chunkSize })
+      }
+    )
+
+    const request = {
+      on: jest.fn()
+    } as unknown as Request
+    const response = createSseResponseMock()
+
+    const moduleRef = await createTestingModule()
+    const controller = moduleRef.get(AdminController)
+    await controller.runManagedTableBackfill('namuwiki_documents', '25', request, response)
+
+    expect(response.body.join('')).toContain('event: started')
+    expect(response.body.join('')).toContain('event: completed')
+    expect(adminServiceMock.runManagedTableBackfill).toHaveBeenCalledWith(
+      'namuwiki_documents',
+      25,
+      expect.any(Function),
+      expect.any(Function)
+    )
+    expect(response.end).toHaveBeenCalled()
   })
 
   it('streams bm25 indexing events over sse', async () => {

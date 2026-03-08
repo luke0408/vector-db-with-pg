@@ -5,8 +5,7 @@ describe('mergeRegisterExistingTableRequest', () => {
     const merged = mergeRegisterExistingTableRequest(
       {
         tableName: 'namuwiki_documents',
-        language: 'korean',
-        initializeData: false
+        language: 'korean'
       },
       {
         tableName: 'namuwiki_documents',
@@ -45,7 +44,6 @@ describe('mergeRegisterExistingTableRequest', () => {
     expect(merged.makeDefault).toBe(true)
     expect(merged.embeddingColumn).toBe('embedding_qwen')
     expect(merged.embeddingHnswColumn).toBe('embedding_hnsw')
-    expect(merged.initializeData).toBe(false)
   })
 
   it('allows explicit nullable fields to clear existing metadata', () => {
@@ -90,6 +88,5 @@ describe('mergeRegisterExistingTableRequest', () => {
     expect(merged.docHashColumn).toBeNull()
     expect(merged.description).toBe('')
     expect(merged.makeDefault).toBe(false)
-    expect(merged.initializeData).toBe(true)
   })
 })

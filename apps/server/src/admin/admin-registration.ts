@@ -47,7 +47,6 @@ export interface RegistrationDraftConfig {
   embeddingHnswDim: number
   reductionMethod: string
   description: string | null
-  initializeData: boolean
   makeDefault: boolean
 }
 
@@ -88,7 +87,6 @@ export function mergeRegisterExistingTableRequest(
       request.description !== undefined
         ? request.description
         : (existing?.description ?? null),
-    initializeData: request.initializeData ?? true,
     makeDefault: request.makeDefault ?? existing?.isDefault ?? false
   }
 }

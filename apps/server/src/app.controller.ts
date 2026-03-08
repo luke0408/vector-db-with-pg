@@ -263,7 +263,7 @@ export class AppController {
     const limit = this.toIntOrDefault(rawRequest.limit, 20)
     const embeddingModel = rawRequest.embeddingModel ?? 'qwen3'
 
-    if (embeddingModel !== 'base' && embeddingModel !== 'qwen3') {
+    if (embeddingModel !== 'qwen3') {
       return {
         value: {
           query: normalizedQuery,
@@ -272,7 +272,7 @@ export class AppController {
           tableName: rawRequest.tableName?.trim() || undefined,
           embeddingModel: 'qwen3'
         },
-        error: 'embeddingModel must be one of base, qwen3'
+        error: 'embeddingModel must be qwen3'
       }
     }
 
@@ -358,7 +358,7 @@ export class AppController {
       }
     }
 
-    if (embeddingModel !== 'base' && embeddingModel !== 'qwen3') {
+    if (embeddingModel !== 'qwen3') {
       return {
         value: {
           ...parsedSearch.value,
@@ -367,7 +367,7 @@ export class AppController {
           hybridRatio,
           embeddingModel: 'qwen3'
         },
-        error: 'embeddingModel must be one of base, qwen3'
+        error: 'embeddingModel must be qwen3'
       }
     }
 
@@ -378,7 +378,7 @@ export class AppController {
           mode,
           bm25Enabled,
           hybridRatio: 50,
-          embeddingModel: 'base'
+          embeddingModel: 'qwen3'
         },
         error: 'hybridRatio must be between 0 and 100'
       }

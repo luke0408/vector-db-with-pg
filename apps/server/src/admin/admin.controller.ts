@@ -21,6 +21,8 @@ import type {
   Bm25LanguageStatus,
   Bm25SettingsUpdateRequest,
   ManagedDocumentMutationResult,
+  ManagedTableBackfillEvent,
+  ManagedTableBackfillStatus,
   ManagedDocumentUpsertRequest,
   ManagedLanguageSummary,
   ManagedTableSummary,
@@ -200,6 +202,115 @@ export class AdminController {
     }
   }
 
+  @Post('tables/:tableName/backfill')
+  async prepareManagedTableBackfill(
+    @Param('tableName') tableName: string
+  ): Promise<ApiResponse<ManagedTableBackfillStatus>> {
+    try {
+      const status = await this.adminService.prepareTableBackfill(tableName)
+      return {
+        success: true,
+        data: [status]
+      }
+    } catch (error) {
+      return {
+        success: false,
+        data: [],
+        error: this.toErrorMessage(error, 'Failed to prepare table backfill')
+      }
+    }
+  }
+
+  @Get('tables/:tableName/backfill/status')
+  async getManagedTableBackfillStatus(
+    @Param('tableName') tableName: string
+  ): Promise<ApiResponse<ManagedTableBackfillStatus>> {
+    try {
+      const status = await this.adminService.getManagedTableBackfillStatus(tableName)
+      return {
+        success: true,
+        data: [status]
+      }
+    } catch (error) {
+      return {
+        success: false,
+        data: [],
+        error: this.toErrorMessage(error, 'Failed to load table backfill status')
+      }
+    }
+  }
+
+  @Post('tables/:tableName/backfill/cancel')
+  async cancelManagedTableBackfill(
+    @Param('tableName') tableName: string
+  ): Promise<ApiResponse<ManagedTableBackfillStatus>> {
+    try {
+      const status = await this.adminService.cancelTableBackfill(tableName)
+      return {
+        success: true,
+        data: [status]
+      }
+    } catch (error) {
+      return {
+        success: false,
+        data: [],
+        error: this.toErrorMessage(error, 'Failed to cancel table backfill')
+      }
+    }
+  }
+
+  @Get('tables/:tableName/backfill/run')
+  async runManagedTableBackfill(
+    @Param('tableName') tableName: string,
+    @Query('chunkSize') chunkSize: string | undefined,
+    @Req() request: Request,
+    @Res() response: Response
+  ): Promise<void> {
+    const parsedChunkSize = this.parseChunkSize(chunkSize)
+
+    if (parsedChunkSize.error) {
+      response.status(400).json({
+        success: false,
+        data: [],
+        error: parsedChunkSize.error
+      })
+      return
+    }
+
+    let cancelled = false
+    request.on('close', () => {
+      cancelled = true
+    })
+
+    response.setHeader('Content-Type', 'text/event-stream')
+    response.setHeader('Cache-Control', 'no-cache, no-transform')
+    response.setHeader('Connection', 'keep-alive')
+    response.flushHeaders?.()
+
+    const emit = (event: ManagedTableBackfillEvent): void => {
+      response.write(`event: ${event.event}\n`)
+      response.write(`data: ${JSON.stringify(event)}\n\n`)
+    }
+
+    try {
+      await this.adminService.runManagedTableBackfill(
+        tableName,
+        parsedChunkSize.value,
+        emit,
+        () => cancelled
+      )
+    } catch (error) {
+      emit({
+        event: 'error',
+        tableName,
+        chunkSize: parsedChunkSize.value,
+        message: this.toErrorMessage(error, 'Failed to run table backfill')
+      })
+    } finally {
+      response.end()
+    }
+  }
+
   @Post('documents/:tableName')
   async createManagedDocument(
     @Param('tableName') tableName: string,
@@ -341,7 +452,6 @@ export class AdminController {
         embeddingHnswDim: rawRequest.embeddingHnswDim,
         reductionMethod: rawRequest.reductionMethod?.trim(),
         description: rawRequest.description?.trim(),
-        initializeData: rawRequest.initializeData,
         makeDefault: rawRequest.makeDefault
       }
     }
@@ -371,7 +481,6 @@ export class AdminController {
       embeddingHnswDim: this.pickOptionalNumber(raw, 'embeddingHnswDim'),
       reductionMethod: this.pickOptionalString(raw, 'reductionMethod'),
       description: this.pickOptionalString(raw, 'description'),
-      initializeData: this.pickOptionalBoolean(raw, 'initializeData'),
       makeDefault: this.pickOptionalBoolean(raw, 'makeDefault')
     }
   }
