@@ -63,6 +63,83 @@ export interface SearchRequestOptions {
   embeddingModel?: 'base' | 'qwen3'
 }
 
+export interface ManagedLanguageSummary {
+  language: string
+  tableSuffix: string
+  k1: number
+  b: number
+  lastIndexedAt: string | null
+  managedTableCount: number
+  documentCount: number
+  tokenCount: number
+  pendingTasks: number
+  inProgressTasks: number
+  completedTasks: number
+}
+
+export interface ManagedTableSummary {
+  tableName: string
+  language: string
+  idColumn: string
+  docHashColumn: string | null
+  titleColumn: string
+  contentColumn: string
+  textlenColumn: string
+  ftsColumn: string
+  embeddingColumn: string
+  embeddingHnswColumn: string
+  embeddingDim: number
+  embeddingHnswDim: number
+  reductionMethod: string
+  description: string | null
+  isDefault: boolean
+  isActive: boolean
+  rowCount: number
+  lastIndexedAt: string | null
+}
+
+export interface Bm25LanguageStatus {
+  language: string
+  tableSuffix: string
+  k1: number
+  b: number
+  lastIndexedAt: string | null
+  queue: {
+    pending: number
+    inProgress: number
+    completed: number
+  }
+  lengths: {
+    managedTables: number
+    totalDocuments: number
+    totalLength: number
+    averageLength: number
+  }
+  tokens: {
+    uniqueTokens: number
+  }
+  managedTablesUsingLanguage: string[]
+}
+
+export interface RegisterExistingTableRequest {
+  tableName: string
+  language?: string
+  initializeData?: boolean
+  makeDefault?: boolean
+}
+
+export interface RegisterExistingTableResult {
+  table: ManagedTableSummary
+  initializedData: boolean
+  bm25LanguageStatus: Bm25LanguageStatus
+}
+
+export interface ApiEnvelope<T> {
+  success: boolean
+  data: T[]
+  error?: string
+}
+
 const SERVER_BASE_URL = import.meta.env.VITE_SERVER_URL ?? 'http://localhost:3000'
 
 export async function searchDocuments(
@@ -80,14 +157,51 @@ export async function searchDocuments(
   }
 
   const endpoint = options.useHybrid ? '/api/search/hybrid' : '/api/search'
+  return requestJson<SearchResponse>(endpoint, {
+    method: 'POST',
+    body: JSON.stringify(payload)
+  })
+}
 
+export async function listAdminLanguages(): Promise<ApiEnvelope<ManagedLanguageSummary>> {
+  return requestJson<ApiEnvelope<ManagedLanguageSummary>>('/api/admin/languages')
+}
+
+export async function listManagedTables(): Promise<ApiEnvelope<ManagedTableSummary>> {
+  return requestJson<ApiEnvelope<ManagedTableSummary>>('/api/admin/tables')
+}
+
+export async function getBm25LanguageStatus(
+  language: string
+): Promise<ApiEnvelope<Bm25LanguageStatus>> {
+  return requestJson<ApiEnvelope<Bm25LanguageStatus>>(
+    `/api/admin/bm25/${encodeURIComponent(language)}/status`
+  )
+}
+
+export async function registerExistingTable(
+  payload: RegisterExistingTableRequest
+): Promise<ApiEnvelope<RegisterExistingTableResult>> {
+  return requestJson<ApiEnvelope<RegisterExistingTableResult>>(
+    '/api/admin/tables/register-existing',
+    {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    }
+  )
+}
+
+async function requestJson<T>(
+  endpoint: string,
+  init: RequestInit = {}
+): Promise<T> {
   try {
     const response = await fetch(`${SERVER_BASE_URL}${endpoint}`, {
-      method: 'POST',
       headers: {
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        ...(init.headers ?? {})
       },
-      body: JSON.stringify(payload)
+      ...init
     })
 
     if (!response.ok) {
@@ -95,18 +209,16 @@ export async function searchDocuments(
         success: false,
         data: [],
         error: `Request failed with status ${response.status}`
-      }
+      } as T
     }
 
-    const parsed = (await response.json()) as SearchResponse
-    return parsed
+    return (await response.json()) as T
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error'
-
     return {
       success: false,
       data: [],
-      error: `Search request failed: ${message}`
-    }
+      error: `Request failed: ${message}`
+    } as T
   }
 }

@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common'
 import { LoggerModule } from 'nestjs-pino'
+import { AdminModule } from './admin/admin.module'
 import { AppController } from './app.controller'
 import { AppService } from './app.service'
 import { PrismaModule } from './prisma/prisma.module'
@@ -8,6 +9,7 @@ import { QueryEmbeddingService } from './query-embedding.service'
 @Module({
   imports: [
     PrismaModule,
+    AdminModule,
     LoggerModule.forRoot({
       pinoHttp: {
         level: process.env.LOG_LEVEL ?? 'info',

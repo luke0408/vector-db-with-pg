@@ -1,17 +1,31 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { App } from './App'
-import { searchDocuments } from './lib/search-api'
+import {
+  getBm25LanguageStatus,
+  listAdminLanguages,
+  listManagedTables,
+  registerExistingTable,
+  searchDocuments
+} from './lib/search-api'
 
 vi.mock('./lib/search-api', async () => {
   const actual = await vi.importActual<typeof import('./lib/search-api')>('./lib/search-api')
 
   return {
     ...actual,
-    searchDocuments: vi.fn()
+    searchDocuments: vi.fn(),
+    listAdminLanguages: vi.fn(),
+    listManagedTables: vi.fn(),
+    getBm25LanguageStatus: vi.fn(),
+    registerExistingTable: vi.fn()
   }
 })
 
 const mockedSearchDocuments = vi.mocked(searchDocuments)
+const mockedListAdminLanguages = vi.mocked(listAdminLanguages)
+const mockedListManagedTables = vi.mocked(listManagedTables)
+const mockedGetBm25LanguageStatus = vi.mocked(getBm25LanguageStatus)
+const mockedRegisterExistingTable = vi.mocked(registerExistingTable)
 
 describe('App', () => {
   beforeEach(() => {
@@ -33,6 +47,130 @@ describe('App', () => {
         limit: 10,
         tookMs: 1
       }
+    })
+
+    mockedListAdminLanguages.mockResolvedValue({
+      success: true,
+      data: [
+        {
+          language: 'korean',
+          tableSuffix: 'korean',
+          k1: 1.2,
+          b: 0.75,
+          lastIndexedAt: null,
+          managedTableCount: 1,
+          documentCount: 59008,
+          tokenCount: 1234,
+          pendingTasks: 0,
+          inProgressTasks: 0,
+          completedTasks: 0
+        }
+      ]
+    })
+
+    mockedListManagedTables.mockResolvedValue({
+      success: true,
+      data: [
+        {
+          tableName: 'namuwiki_documents',
+          language: 'korean',
+          idColumn: 'id',
+          docHashColumn: 'doc_hash',
+          titleColumn: 'title',
+          contentColumn: 'content',
+          textlenColumn: 'textlen',
+          ftsColumn: 'fts',
+          embeddingColumn: 'embedding_qwen',
+          embeddingHnswColumn: 'embedding_hnsw',
+          embeddingDim: 1024,
+          embeddingHnswDim: 1024,
+          reductionMethod: 'prefix_truncation',
+          description: 'Phase 1',
+          isDefault: true,
+          isActive: true,
+          rowCount: 59008,
+          lastIndexedAt: null
+        }
+      ]
+    })
+
+    mockedGetBm25LanguageStatus.mockResolvedValue({
+      success: true,
+      data: [
+        {
+          language: 'korean',
+          tableSuffix: 'korean',
+          k1: 1.2,
+          b: 0.75,
+          lastIndexedAt: null,
+          queue: {
+            pending: 0,
+            inProgress: 0,
+            completed: 0
+          },
+          lengths: {
+            managedTables: 1,
+            totalDocuments: 59008,
+            totalLength: 123456,
+            averageLength: 2.1
+          },
+          tokens: {
+            uniqueTokens: 1234
+          },
+          managedTablesUsingLanguage: ['namuwiki_documents']
+        }
+      ]
+    })
+
+    mockedRegisterExistingTable.mockResolvedValue({
+      success: true,
+      data: [
+        {
+          table: {
+            tableName: 'namuwiki_documents',
+            language: 'korean',
+            idColumn: 'id',
+            docHashColumn: 'doc_hash',
+            titleColumn: 'title',
+            contentColumn: 'content',
+            textlenColumn: 'textlen',
+            ftsColumn: 'fts',
+            embeddingColumn: 'embedding_qwen',
+            embeddingHnswColumn: 'embedding_hnsw',
+            embeddingDim: 1024,
+            embeddingHnswDim: 1024,
+            reductionMethod: 'prefix_truncation',
+            description: 'Phase 1',
+            isDefault: true,
+            isActive: true,
+            rowCount: 59008,
+            lastIndexedAt: null
+          },
+          initializedData: true,
+          bm25LanguageStatus: {
+            language: 'korean',
+            tableSuffix: 'korean',
+            k1: 1.2,
+            b: 0.75,
+            lastIndexedAt: '2026-03-08T00:00:00.000Z',
+            queue: {
+              pending: 0,
+              inProgress: 0,
+              completed: 0
+            },
+            lengths: {
+              managedTables: 1,
+              totalDocuments: 59008,
+              totalLength: 123456,
+              averageLength: 2.1
+            },
+            tokens: {
+              uniqueTokens: 1234
+            },
+            managedTablesUsingLanguage: ['namuwiki_documents']
+          }
+        }
+      ]
     })
   })
 
@@ -135,6 +273,37 @@ describe('App', () => {
       expect(
         screen.getByText(/Roblox의 Bee Swarm Simulator 의 몹에 관한 문서이다\./)
       ).toBeInTheDocument()
+    })
+  })
+
+  it('loads admin overview and registers namuwiki table', async () => {
+    render(<App />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Admin' }))
+
+    await waitFor(() => {
+      expect(mockedListAdminLanguages).toHaveBeenCalledTimes(1)
+      expect(mockedListManagedTables).toHaveBeenCalledTimes(1)
+    })
+
+    await waitFor(() => {
+      expect(mockedGetBm25LanguageStatus).toHaveBeenCalledWith('korean')
+    })
+
+    expect(screen.getByText('Supported Languages')).toBeInTheDocument()
+    expect(screen.getAllByText('namuwiki_documents').length).toBeGreaterThan(0)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Register NamuWiki Table' }))
+
+    await waitFor(() => {
+      expect(mockedRegisterExistingTable).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tableName: 'namuwiki_documents',
+          language: 'korean',
+          initializeData: true,
+          makeDefault: true
+        })
+      )
     })
   })
 })
