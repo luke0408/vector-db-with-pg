@@ -2,11 +2,21 @@ import { Injectable } from '@nestjs/common'
 import { createHash } from 'node:crypto'
 import { PrismaService } from '../prisma/prisma.service'
 import {
+  buildDocumentFrequencyDeltas,
+  buildLengthDeltas,
+  consolidateQueuedTasks,
+  type ClaimedBm25Task
+} from './admin-indexing'
+import {
   mergeRegisterExistingTableRequest,
   type ExistingManagedTableConfigSnapshot
 } from './admin-registration'
 import type {
+  Bm25IndexingEvent,
   Bm25LanguageStatus,
+  Bm25SettingsUpdateRequest,
+  ManagedDocumentMutationResult,
+  ManagedDocumentUpsertRequest,
   ManagedLanguageSummary,
   ManagedTableSummary,
   RegisterExistingTableRequest,
@@ -73,6 +83,26 @@ const SAFE_IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 const DEFAULT_EMBEDDING_DIM = 1024
 const DEFAULT_HNSW_DIM = 1024
 const DEFAULT_REDUCTION_METHOD = 'prefix_truncation'
+
+
+type RawClient = Pick<
+  PrismaService,
+  '$queryRawUnsafe' | '$executeRawUnsafe'
+>
+
+interface ComputedFtsPayload {
+  ftsText: string
+  textlen: number
+}
+
+interface ManagedDocumentSnapshot {
+  id: number
+  docHash: string | null
+  title: string | null
+  content: string
+  textlen: number | null
+  ftsText: string | null
+}
 
 @Injectable()
 export class AdminService {
@@ -271,6 +301,411 @@ export class AdminService {
     }
   }
 
+  async updateBm25Settings(
+    language: string,
+    request: Bm25SettingsUpdateRequest
+  ): Promise<Bm25LanguageStatus> {
+    await this.ensureBootstrap()
+
+    const normalizedLanguage = this.normalizeLanguage(language)
+    const supportedLanguage = await this.getSupportedLanguage(normalizedLanguage)
+
+    if (!supportedLanguage) {
+      throw new Error(`Unsupported text search language: ${normalizedLanguage}`)
+    }
+
+    const nextK1 = request.k1
+    const nextB = request.b
+
+    if (nextK1 !== undefined && (!Number.isFinite(nextK1) || nextK1 <= 0)) {
+      throw new Error('k1 must be greater than 0')
+    }
+
+    if (nextB !== undefined && (!Number.isFinite(nextB) || nextB < 0 || nextB > 1)) {
+      throw new Error('b must be between 0 and 1')
+    }
+
+    await this.exec(
+      `
+        UPDATE search_bm25_language_settings
+        SET
+          k1 = COALESCE($2, k1),
+          b = COALESCE($3, b),
+          updated_at = NOW()
+        WHERE language = $1
+      `,
+      normalizedLanguage,
+      nextK1 ?? null,
+      nextB ?? null
+    )
+
+    return this.getBm25LanguageStatus(normalizedLanguage)
+  }
+
+  async createManagedDocument(
+    tableName: string,
+    request: ManagedDocumentUpsertRequest
+  ): Promise<ManagedDocumentMutationResult> {
+    await this.ensureBootstrap()
+
+    const config = await this.getManagedTableRowOrThrow(tableName)
+
+    if (typeof request.content !== 'string') {
+      throw new Error('content must be provided as string')
+    }
+
+    const title = request.title ?? null
+    const content = request.content
+
+    return this.prismaService.$transaction(async (tx) => {
+      const ftsPayload = await this.computeFtsPayload(config.language, title, content, tx)
+      const insertParams: unknown[] = []
+      const columns: string[] = []
+      const values: string[] = []
+
+      if (config.doc_hash_column) {
+        if (typeof request.docHash !== 'string' || !request.docHash.trim()) {
+          throw new Error('docHash is required for this managed table')
+        }
+
+        columns.push(this.quoteIdentifier(config.doc_hash_column))
+        insertParams.push(request.docHash.trim())
+        values.push(`$${insertParams.length}`)
+      }
+
+      columns.push(this.quoteIdentifier(config.title_column))
+      insertParams.push(title)
+      values.push(`$${insertParams.length}`)
+
+      columns.push(this.quoteIdentifier(config.content_column))
+      insertParams.push(content)
+      values.push(`$${insertParams.length}`)
+
+      columns.push(this.quoteIdentifier(config.textlen_column))
+      insertParams.push(ftsPayload.textlen)
+      values.push(`$${insertParams.length}`)
+
+      columns.push(this.quoteIdentifier(config.fts_column))
+      insertParams.push(ftsPayload.ftsText)
+      values.push(`$${insertParams.length}::tsvector`)
+
+      const embeddingLiteral = request.embedding
+        ? this.toVectorLiteral(request.embedding, config.embedding_dim, 'embedding')
+        : null
+      const embeddingHnswLiteral = request.embeddingHnsw
+        ? this.toVectorLiteral(
+            request.embeddingHnsw,
+            config.embedding_hnsw_dim,
+            'embeddingHnsw'
+          )
+        : (embeddingLiteral && config.embedding_dim === config.embedding_hnsw_dim
+            ? embeddingLiteral
+            : null)
+
+      if (embeddingLiteral) {
+        columns.push(this.quoteIdentifier(config.embedding_column))
+        insertParams.push(embeddingLiteral)
+        values.push(`$${insertParams.length}::vector`)
+      }
+
+      if (embeddingHnswLiteral) {
+        columns.push(this.quoteIdentifier(config.embedding_hnsw_column))
+        insertParams.push(embeddingHnswLiteral)
+        values.push(`$${insertParams.length}::vector`)
+      }
+
+      const tableSql = this.quoteIdentifier(config.table_name)
+      const idColumnSql = this.quoteIdentifier(config.id_column)
+      const [inserted] = await this.query<{ id: bigint | number }>(
+        `
+          INSERT INTO ${tableSql} (${columns.join(', ')})
+          VALUES (${values.join(', ')})
+          RETURNING ${idColumnSql} AS id
+        `,
+        tx,
+        ...insertParams
+      )
+
+      const insertedId = Number(inserted?.id ?? 0)
+
+      await this.enqueueTask(
+        config.language,
+        {
+          taskType: 0,
+          tableName: config.table_name,
+          id: insertedId,
+          oldLen: null,
+          oldFtsText: null,
+          newLen: ftsPayload.textlen,
+          newFtsText: ftsPayload.ftsText
+        },
+        tx
+      )
+
+      return {
+        tableName: config.table_name,
+        language: config.language,
+        id: insertedId,
+        taskQueued: true,
+        taskType: 'insert'
+      }
+    })
+  }
+
+  async updateManagedDocument(
+    tableName: string,
+    id: number,
+    request: ManagedDocumentUpsertRequest
+  ): Promise<ManagedDocumentMutationResult> {
+    await this.ensureBootstrap()
+
+    const config = await this.getManagedTableRowOrThrow(tableName)
+
+    return this.prismaService.$transaction(async (tx) => {
+      const existing = await this.getManagedDocumentSnapshot(config, id, tx)
+
+      if (!existing) {
+        throw new Error(`Document ${id} was not found in ${config.table_name}`)
+      }
+
+      const nextTitle = request.title !== undefined ? request.title : existing.title
+      const nextContent = request.content !== undefined ? request.content : existing.content
+
+      if (typeof nextContent !== 'string') {
+        throw new Error('content must resolve to a string')
+      }
+
+      const ftsPayload = await this.computeFtsPayload(
+        config.language,
+        nextTitle ?? null,
+        nextContent,
+        tx
+      )
+
+      const updates: string[] = []
+      const params: unknown[] = []
+
+      if (config.doc_hash_column && request.docHash !== undefined) {
+        if (request.docHash !== null && !request.docHash.trim()) {
+          throw new Error('docHash cannot be empty')
+        }
+
+        params.push(request.docHash === null ? null : request.docHash.trim())
+        updates.push(`${this.quoteIdentifier(config.doc_hash_column)} = $${params.length}`)
+      }
+
+      if (request.title !== undefined) {
+        params.push(request.title)
+        updates.push(`${this.quoteIdentifier(config.title_column)} = $${params.length}`)
+      }
+
+      if (request.content !== undefined) {
+        params.push(request.content)
+        updates.push(`${this.quoteIdentifier(config.content_column)} = $${params.length}`)
+      }
+
+      const embeddingLiteral = request.embedding
+        ? this.toVectorLiteral(request.embedding, config.embedding_dim, 'embedding')
+        : null
+      const embeddingHnswLiteral = request.embeddingHnsw
+        ? this.toVectorLiteral(
+            request.embeddingHnsw,
+            config.embedding_hnsw_dim,
+            'embeddingHnsw'
+          )
+        : undefined
+
+      if (request.embedding !== undefined) {
+        params.push(embeddingLiteral)
+        updates.push(`${this.quoteIdentifier(config.embedding_column)} = $${params.length}::vector`)
+      }
+
+      if (request.embeddingHnsw !== undefined) {
+        params.push(embeddingHnswLiteral ?? null)
+        updates.push(`${this.quoteIdentifier(config.embedding_hnsw_column)} = $${params.length}::vector`)
+      } else if (
+        request.embedding !== undefined &&
+        embeddingLiteral &&
+        config.embedding_dim === config.embedding_hnsw_dim
+      ) {
+        params.push(embeddingLiteral)
+        updates.push(`${this.quoteIdentifier(config.embedding_hnsw_column)} = $${params.length}::vector`)
+      }
+
+      params.push(ftsPayload.textlen)
+      updates.push(`${this.quoteIdentifier(config.textlen_column)} = $${params.length}`)
+      params.push(ftsPayload.ftsText)
+      updates.push(`${this.quoteIdentifier(config.fts_column)} = $${params.length}::tsvector`)
+
+      const tableSql = this.quoteIdentifier(config.table_name)
+      const idColumnSql = this.quoteIdentifier(config.id_column)
+      params.push(id)
+
+      await this.exec(
+        `
+          UPDATE ${tableSql}
+          SET ${updates.join(', ')}
+          WHERE ${idColumnSql} = $${params.length}
+        `,
+        tx,
+        ...params
+      )
+
+      await this.enqueueTask(
+        config.language,
+        {
+          taskType: 1,
+          tableName: config.table_name,
+          id,
+          oldLen: existing.textlen,
+          oldFtsText: existing.ftsText,
+          newLen: ftsPayload.textlen,
+          newFtsText: ftsPayload.ftsText
+        },
+        tx
+      )
+
+      return {
+        tableName: config.table_name,
+        language: config.language,
+        id,
+        taskQueued: true,
+        taskType: 'update'
+      }
+    })
+  }
+
+  async deleteManagedDocument(
+    tableName: string,
+    id: number
+  ): Promise<ManagedDocumentMutationResult> {
+    await this.ensureBootstrap()
+
+    const config = await this.getManagedTableRowOrThrow(tableName)
+
+    return this.prismaService.$transaction(async (tx) => {
+      const existing = await this.getManagedDocumentSnapshot(config, id, tx)
+
+      if (!existing) {
+        throw new Error(`Document ${id} was not found in ${config.table_name}`)
+      }
+
+      const tableSql = this.quoteIdentifier(config.table_name)
+      const idColumnSql = this.quoteIdentifier(config.id_column)
+      await this.exec(
+        `DELETE FROM ${tableSql} WHERE ${idColumnSql} = $1`,
+        tx,
+        id
+      )
+
+      await this.enqueueTask(
+        config.language,
+        {
+          taskType: 2,
+          tableName: config.table_name,
+          id,
+          oldLen: existing.textlen,
+          oldFtsText: existing.ftsText,
+          newLen: null,
+          newFtsText: null
+        },
+        tx
+      )
+
+      return {
+        tableName: config.table_name,
+        language: config.language,
+        id,
+        taskQueued: true,
+        taskType: 'delete'
+      }
+    })
+  }
+
+  async runBm25Indexing(
+    language: string,
+    chunkSize: number,
+    emit: (event: Bm25IndexingEvent) => void,
+    isCancelled: () => boolean
+  ): Promise<void> {
+    await this.ensureBootstrap()
+
+    const normalizedLanguage = this.normalizeLanguage(language)
+    const supportedLanguage = await this.getSupportedLanguage(normalizedLanguage)
+
+    if (!supportedLanguage) {
+      throw new Error(`Unsupported text search language: ${normalizedLanguage}`)
+    }
+
+    const normalizedChunkSize = Math.max(1, Math.min(Math.trunc(chunkSize || 100), 1000))
+    const startedAt = Date.now()
+    let processedTasks = 0
+
+    emit({
+      event: 'started',
+      language: normalizedLanguage,
+      chunkSize: normalizedChunkSize,
+      processedTasks: 0,
+      remainingTasks: await this.countRemainingTasks(supportedLanguage.table_suffix)
+    })
+
+    await this.deleteCompletedTasks(supportedLanguage.table_suffix)
+
+    while (true) {
+      if (isCancelled()) {
+        emit({
+          event: 'cancelled',
+          language: normalizedLanguage,
+          chunkSize: normalizedChunkSize,
+          processedTasks,
+          remainingTasks: await this.countRemainingTasks(supportedLanguage.table_suffix),
+          elapsedMs: Date.now() - startedAt
+        })
+        return
+      }
+
+      const claimedTasks = await this.claimTaskChunk(
+        supportedLanguage.table_suffix,
+        normalizedChunkSize
+      )
+
+      if (claimedTasks.length === 0) {
+        emit({
+          event: 'completed',
+          language: normalizedLanguage,
+          chunkSize: normalizedChunkSize,
+          processedTasks,
+          remainingTasks: 0,
+          elapsedMs: Date.now() - startedAt
+        })
+        return
+      }
+
+      const consolidated = consolidateQueuedTasks(claimedTasks)
+      await this.applyConsolidatedTasks(
+        normalizedLanguage,
+        supportedLanguage.table_suffix,
+        consolidated
+      )
+      await this.markTasksCompleted(
+        supportedLanguage.table_suffix,
+        claimedTasks.map((task) => task.rowId)
+      )
+
+      processedTasks += claimedTasks.length
+
+      emit({
+        event: 'chunk',
+        language: normalizedLanguage,
+        chunkSize: normalizedChunkSize,
+        claimedTasks: claimedTasks.length,
+        affectedDocs: consolidated.length,
+        processedTasks,
+        remainingTasks: await this.countRemainingTasks(supportedLanguage.table_suffix),
+        elapsedMs: Date.now() - startedAt
+      })
+    }
+  }
   private async ensureBootstrap(): Promise<void> {
     if (!this.bootstrapPromise) {
       this.bootstrapPromise = this.performBootstrap().catch((error) => {
@@ -910,6 +1345,371 @@ export class AdminService {
     )
   }
 
+  private async getManagedTableRowOrThrow(
+    tableName: string
+  ): Promise<ManagedTableRow> {
+    const safeTableName = this.ensureSafeIdentifier(tableName)
+    const [row] = await this.query<ManagedTableRow>(
+      `
+        SELECT
+          table_name,
+          id_column,
+          doc_hash_column,
+          title_column,
+          content_column,
+          textlen_column,
+          fts_column,
+          embedding_column,
+          embedding_hnsw_column,
+          language,
+          embedding_dim,
+          embedding_hnsw_dim,
+          reduction_method,
+          description,
+          is_default,
+          is_active
+        FROM search_managed_tables
+        WHERE table_name = $1 AND is_active = TRUE
+      `,
+      this.prismaService,
+      safeTableName
+    )
+
+    if (!row) {
+      throw new Error(`Managed table not found or inactive: ${safeTableName}`)
+    }
+
+    return row
+  }
+
+  private async getManagedDocumentSnapshot(
+    config: ManagedTableRow,
+    id: number,
+    client: RawClient
+  ): Promise<ManagedDocumentSnapshot | null> {
+    const tableSql = this.quoteIdentifier(config.table_name)
+    const idColumnSql = this.quoteIdentifier(config.id_column)
+    const titleColumnSql = this.quoteIdentifier(config.title_column)
+    const contentColumnSql = this.quoteIdentifier(config.content_column)
+    const textlenColumnSql = this.quoteIdentifier(config.textlen_column)
+    const ftsColumnSql = this.quoteIdentifier(config.fts_column)
+    const docHashSelect = config.doc_hash_column
+      ? `${this.quoteIdentifier(config.doc_hash_column)} AS "docHash",`
+      : `NULL::text AS "docHash",`
+
+    const [row] = await this.query<{
+      id: bigint | number
+      docHash: string | null
+      title: string | null
+      content: string
+      textlen: number | null
+      ftsText: string | null
+    }>(
+      `
+        SELECT
+          ${idColumnSql} AS id,
+          ${docHashSelect}
+          ${titleColumnSql} AS title,
+          ${contentColumnSql} AS content,
+          ${textlenColumnSql} AS textlen,
+          ${ftsColumnSql}::text AS "ftsText"
+        FROM ${tableSql}
+        WHERE ${idColumnSql} = $1
+      `,
+      client,
+      id
+    )
+
+    if (!row) {
+      return null
+    }
+
+    return {
+      id: Number(row.id),
+      docHash: row.docHash,
+      title: row.title,
+      content: row.content,
+      textlen: row.textlen,
+      ftsText: row.ftsText
+    }
+  }
+
+  private async computeFtsPayload(
+    language: string,
+    title: string | null,
+    content: string,
+    client: RawClient
+  ): Promise<ComputedFtsPayload> {
+    const [row] = await this.query<{ fts_text: string; textlen: number }>(
+      `
+        SELECT
+          to_tsvector($1::regconfig, concat_ws(' ', COALESCE($2, ''), COALESCE($3, '')))::text AS fts_text,
+          COALESCE(
+            array_length(
+              tsvector_to_array(
+                to_tsvector($1::regconfig, concat_ws(' ', COALESCE($2, ''), COALESCE($3, '')))
+              ),
+              1
+            ),
+            0
+          )::int AS textlen
+      `,
+      client,
+      language,
+      title,
+      content
+    )
+
+    return {
+      ftsText: row?.fts_text ?? '',
+      textlen: Number(row?.textlen ?? 0)
+    }
+  }
+
+  private async enqueueTask(
+    language: string,
+    payload: {
+      taskType: number
+      tableName: string
+      id: number
+      oldLen: number | null
+      oldFtsText: string | null
+      newLen: number | null
+      newFtsText: string | null
+    },
+    client: RawClient
+  ): Promise<void> {
+    const supportedLanguage = await this.getSupportedLanguage(language)
+
+    if (!supportedLanguage) {
+      throw new Error(`Unsupported text search language: ${language}`)
+    }
+
+    const taskTable = this.quoteIdentifier(`bm25tasks_${supportedLanguage.table_suffix}`)
+    await this.exec(
+      `
+        INSERT INTO ${taskTable} (
+          status,
+          task_type,
+          table_name,
+          id,
+          old_len,
+          old_fts,
+          new_len,
+          new_fts,
+          updated_at
+        )
+        VALUES (
+          0,
+          $1,
+          $2,
+          $3,
+          $4,
+          $5::tsvector,
+          $6,
+          $7::tsvector,
+          NOW()
+        )
+      `,
+      client,
+      payload.taskType,
+      payload.tableName,
+      payload.id,
+      payload.oldLen,
+      payload.oldFtsText,
+      payload.newLen,
+      payload.newFtsText
+    )
+  }
+
+  private async deleteCompletedTasks(tableSuffix: string): Promise<void> {
+    const taskTable = this.quoteIdentifier(`bm25tasks_${tableSuffix}`)
+    await this.exec(`DELETE FROM ${taskTable} WHERE status = 2`)
+  }
+
+  private async claimTaskChunk(
+    tableSuffix: string,
+    chunkSize: number
+  ): Promise<ClaimedBm25Task[]> {
+    const taskTable = this.quoteIdentifier(`bm25tasks_${tableSuffix}`)
+    const rows = await this.query<{
+      rowId: bigint | number
+      taskType: number
+      tableName: string
+      id: bigint | number
+      oldLen: number | null
+      oldFts: string | null
+      newLen: number | null
+      newFts: string | null
+    }>(
+      `
+        WITH claimed AS (
+          SELECT row_id
+          FROM ${taskTable}
+          WHERE status = 0
+          ORDER BY row_id ASC
+          LIMIT $1
+          FOR UPDATE SKIP LOCKED
+        )
+        UPDATE ${taskTable} tasks
+        SET status = 1,
+            updated_at = NOW()
+        WHERE row_id IN (SELECT row_id FROM claimed)
+        RETURNING
+          row_id AS "rowId",
+          task_type AS "taskType",
+          table_name AS "tableName",
+          id,
+          old_len AS "oldLen",
+          old_fts::text AS "oldFts",
+          new_len AS "newLen",
+          new_fts::text AS "newFts"
+      `,
+      this.prismaService,
+      chunkSize
+    )
+
+    return rows.map((row) => ({
+      rowId: Number(row.rowId),
+      taskType: row.taskType,
+      tableName: row.tableName,
+      id: Number(row.id),
+      oldLen: row.oldLen,
+      oldFts: row.oldFts,
+      newLen: row.newLen,
+      newFts: row.newFts
+    }))
+  }
+
+  private async applyConsolidatedTasks(
+    language: string,
+    tableSuffix: string,
+    tasks: ReturnType<typeof consolidateQueuedTasks>
+  ): Promise<void> {
+    if (tasks.length === 0) {
+      return
+    }
+
+    const lengthTable = this.quoteIdentifier(`bm25length_${tableSuffix}`)
+    const tokenTable = this.quoteIdentifier(`bm25tokens_${tableSuffix}`)
+    const idfTable = this.quoteIdentifier(`bm25idf_${tableSuffix}`)
+    const lengthDeltas = buildLengthDeltas(tasks)
+    const docFrequencyDeltas = buildDocumentFrequencyDeltas(tasks)
+
+    await this.prismaService.$transaction(async (tx) => {
+      for (const delta of lengthDeltas) {
+        await this.exec(
+          `
+            INSERT INTO ${lengthTable} (tablename, recordcount, sumlen, avglen)
+            VALUES (
+              $1,
+              GREATEST($2, 0),
+              GREATEST($3, 0),
+              CASE WHEN GREATEST($2, 0) = 0 THEN 0 ELSE GREATEST($3, 0)::double precision / GREATEST($2, 0) END
+            )
+            ON CONFLICT (tablename)
+            DO UPDATE SET
+              recordcount = GREATEST(0, ${lengthTable}.recordcount + $2),
+              sumlen = GREATEST(0, ${lengthTable}.sumlen + $3),
+              avglen = CASE
+                WHEN GREATEST(0, ${lengthTable}.recordcount + $2) = 0 THEN 0
+                ELSE GREATEST(0, ${lengthTable}.sumlen + $3)::double precision /
+                     GREATEST(0, ${lengthTable}.recordcount + $2)
+              END
+          `,
+          tx,
+          delta.tableName,
+          delta.recordCountDelta,
+          delta.sumLenDelta
+        )
+      }
+
+      for (const task of tasks) {
+        await this.exec(`DELETE FROM ${tokenTable} WHERE id = $1`, tx, task.id)
+
+        for (const [token, tf] of task.finalTokens.entries()) {
+          await this.exec(
+            `
+              INSERT INTO ${tokenTable} (id, token, tf)
+              VALUES ($1, $2, $3)
+              ON CONFLICT (id, token)
+              DO UPDATE SET tf = EXCLUDED.tf
+            `,
+            tx,
+            task.id,
+            token,
+            tf
+          )
+        }
+      }
+
+      for (const [token, delta] of docFrequencyDeltas.entries()) {
+        await this.exec(
+          `
+            INSERT INTO ${idfTable} (token, tfdoc)
+            VALUES ($1, GREATEST($2, 0))
+            ON CONFLICT (token)
+            DO UPDATE SET tfdoc = GREATEST(0, ${idfTable}.tfdoc + $2)
+          `,
+          tx,
+          token,
+          delta
+        )
+      }
+
+      await this.exec(`DELETE FROM ${idfTable} WHERE tfdoc <= 0`, tx)
+      await this.exec(
+        `UPDATE search_bm25_language_settings SET last_indexed_at = NOW(), updated_at = NOW() WHERE language = $1`,
+        tx,
+        language
+      )
+    })
+  }
+
+  private async markTasksCompleted(
+    tableSuffix: string,
+    rowIds: number[]
+  ): Promise<void> {
+    if (rowIds.length === 0) {
+      return
+    }
+
+    const taskTable = this.quoteIdentifier(`bm25tasks_${tableSuffix}`)
+    await this.exec(
+      `UPDATE ${taskTable} SET status = 2, updated_at = NOW() WHERE row_id = ANY($1::bigint[])`,
+      rowIds
+    )
+  }
+
+  private async countRemainingTasks(tableSuffix: string): Promise<number> {
+    const taskTable = this.quoteIdentifier(`bm25tasks_${tableSuffix}`)
+    const [row] = await this.query<CountRow>(
+      `SELECT COUNT(*)::bigint AS count FROM ${taskTable} WHERE status = 0`
+    )
+
+    return Number(row?.count ?? 0)
+  }
+
+  private toVectorLiteral(
+    vector: number[],
+    expectedDim: number,
+    fieldName: string
+  ): string {
+    if (!Array.isArray(vector) || vector.length !== expectedDim) {
+      throw new Error(`${fieldName} must contain exactly ${expectedDim} numeric values`)
+    }
+
+    const normalized = vector.map((value) => {
+      if (typeof value !== 'number' || !Number.isFinite(value)) {
+        throw new Error(`${fieldName} must contain only finite numbers`)
+      }
+
+      return value
+    })
+
+    return `[${normalized.join(',')}]`
+  }
+
   private async loadLanguageDynamicStats(
     language: string,
     tableSuffix: string
@@ -1133,12 +1933,40 @@ export class AdminService {
 
   private async query<T>(
     sql: string,
+    clientOrParam?: RawClient | unknown,
     ...params: unknown[]
   ): Promise<T[]> {
-    return this.prismaService.$queryRawUnsafe(sql, ...params) as Promise<T[]>
+    const useExplicitClient = this.isRawClient(clientOrParam)
+    const client = useExplicitClient ? clientOrParam : this.prismaService
+    const values = useExplicitClient
+      ? params
+      : clientOrParam === undefined
+        ? params
+        : [clientOrParam, ...params]
+    return client.$queryRawUnsafe(sql, ...values) as Promise<T[]>
   }
 
-  private async exec(sql: string, ...params: unknown[]): Promise<void> {
-    await this.prismaService.$executeRawUnsafe(sql, ...params)
+  private async exec(
+    sql: string,
+    clientOrParam?: RawClient | unknown,
+    ...params: unknown[]
+  ): Promise<void> {
+    const useExplicitClient = this.isRawClient(clientOrParam)
+    const client = useExplicitClient ? clientOrParam : this.prismaService
+    const values = useExplicitClient
+      ? params
+      : clientOrParam === undefined
+        ? params
+        : [clientOrParam, ...params]
+    await client.$executeRawUnsafe(sql, ...values)
+  }
+
+  private isRawClient(value: unknown): value is RawClient {
+    return Boolean(
+      value &&
+        typeof value === 'object' &&
+        '$queryRawUnsafe' in value &&
+        '$executeRawUnsafe' in value
+    )
   }
 }

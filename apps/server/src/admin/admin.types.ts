@@ -80,3 +80,36 @@ export interface RegisterExistingTableResult {
   initializedData: boolean
   bm25LanguageStatus: Bm25LanguageStatus
 }
+
+export interface Bm25SettingsUpdateRequest {
+  k1?: number
+  b?: number
+}
+
+export interface ManagedDocumentUpsertRequest {
+  docHash?: string | null
+  title?: string | null
+  content?: string
+  embedding?: number[] | null
+  embeddingHnsw?: number[] | null
+}
+
+export interface ManagedDocumentMutationResult {
+  tableName: string
+  language: string
+  id: number
+  taskQueued: boolean
+  taskType: 'insert' | 'update' | 'delete'
+}
+
+export interface Bm25IndexingEvent {
+  event: 'started' | 'chunk' | 'completed' | 'cancelled' | 'error'
+  language: string
+  chunkSize: number
+  claimedTasks?: number
+  affectedDocs?: number
+  processedTasks?: number
+  remainingTasks?: number
+  elapsedMs?: number
+  message?: string
+}

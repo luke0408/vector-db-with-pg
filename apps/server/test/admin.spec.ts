@@ -1,4 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing'
+import type { Request, Response } from 'express'
 import { AdminController } from '../src/admin/admin.controller'
 import { AdminService } from '../src/admin/admin.service'
 
@@ -6,7 +7,12 @@ const adminServiceMock = {
   listLanguages: jest.fn(),
   listManagedTables: jest.fn(),
   getBm25LanguageStatus: jest.fn(),
-  registerExistingTable: jest.fn()
+  registerExistingTable: jest.fn(),
+  updateBm25Settings: jest.fn(),
+  createManagedDocument: jest.fn(),
+  updateManagedDocument: jest.fn(),
+  deleteManagedDocument: jest.fn(),
+  runBm25Indexing: jest.fn()
 }
 
 async function createTestingModule(): Promise<TestingModule> {
@@ -21,12 +27,43 @@ async function createTestingModule(): Promise<TestingModule> {
   }).compile()
 }
 
+function createSseResponseMock(): Response & {
+  body: string[]
+  statusCode?: number
+  jsonBody?: unknown
+} {
+  const body: string[] = []
+  const response = {
+    body,
+    setHeader: jest.fn(),
+    flushHeaders: jest.fn(),
+    write: jest.fn((chunk: string) => {
+      body.push(chunk)
+      return true
+    }),
+    end: jest.fn(),
+    status: jest.fn(function status(this: Response & { statusCode?: number }, code: number) {
+      this.statusCode = code
+      return this
+    }),
+    json: jest.fn(function json(this: Response & { jsonBody?: unknown }, payload: unknown) {
+      this.jsonBody = payload
+      return this
+    })
+  }
+
+  return response as unknown as Response & {
+    body: string[]
+    statusCode?: number
+    jsonBody?: unknown
+  }
+}
+
 describe('AdminController', () => {
   beforeEach(() => {
-    adminServiceMock.listLanguages.mockReset()
-    adminServiceMock.listManagedTables.mockReset()
-    adminServiceMock.getBm25LanguageStatus.mockReset()
-    adminServiceMock.registerExistingTable.mockReset()
+    for (const fn of Object.values(adminServiceMock)) {
+      fn.mockReset()
+    }
   })
 
   it('returns supported languages payload', async () => {
@@ -212,5 +249,173 @@ describe('AdminController', () => {
         makeDefault: true
       })
     )
+  })
+
+  it('updates bm25 settings', async () => {
+    adminServiceMock.updateBm25Settings.mockResolvedValueOnce({
+      language: 'korean',
+      tableSuffix: 'korean',
+      k1: 1.5,
+      b: 0.6,
+      lastIndexedAt: null,
+      queue: { pending: 0, inProgress: 0, completed: 0 },
+      lengths: { managedTables: 1, totalDocuments: 0, totalLength: 0, averageLength: 0 },
+      tokens: { uniqueTokens: 0 },
+      managedTablesUsingLanguage: ['namuwiki_documents']
+    })
+
+    const moduleRef = await createTestingModule()
+    const controller = moduleRef.get(AdminController)
+    const response = await controller.updateBm25Settings('korean', { k1: 1.5, b: 0.6 })
+
+    expect(response.success).toBe(true)
+    expect(adminServiceMock.updateBm25Settings).toHaveBeenCalledWith('korean', {
+      k1: 1.5,
+      b: 0.6
+    })
+  })
+
+  it('rejects empty bm25 settings updates', async () => {
+    const moduleRef = await createTestingModule()
+    const controller = moduleRef.get(AdminController)
+    const response = await controller.updateBm25Settings('korean', {})
+
+    expect(response.success).toBe(false)
+    expect(response.error).toBe('At least one of k1 or b must be provided')
+  })
+
+  it('creates managed document', async () => {
+    adminServiceMock.createManagedDocument.mockResolvedValueOnce({
+      tableName: 'namuwiki_documents',
+      language: 'korean',
+      id: 77,
+      taskQueued: true,
+      taskType: 'insert'
+    })
+
+    const moduleRef = await createTestingModule()
+    const controller = moduleRef.get(AdminController)
+    const response = await controller.createManagedDocument('namuwiki_documents', {
+      docHash: 'hash-1',
+      title: '포켓몬',
+      content: '피카츄',
+      embedding: [0.1, 0.2]
+    })
+
+    expect(response.success).toBe(true)
+    expect(adminServiceMock.createManagedDocument).toHaveBeenCalledWith(
+      'namuwiki_documents',
+      expect.objectContaining({
+        docHash: 'hash-1',
+        title: '포켓몬',
+        content: '피카츄',
+        embedding: [0.1, 0.2]
+      })
+    )
+  })
+
+  it('updates managed document', async () => {
+    adminServiceMock.updateManagedDocument.mockResolvedValueOnce({
+      tableName: 'namuwiki_documents',
+      language: 'korean',
+      id: 77,
+      taskQueued: true,
+      taskType: 'update'
+    })
+
+    const moduleRef = await createTestingModule()
+    const controller = moduleRef.get(AdminController)
+    const response = await controller.updateManagedDocument(
+      'namuwiki_documents',
+      '77',
+      {
+        content: '라이츄'
+      }
+    )
+
+    expect(response.success).toBe(true)
+    expect(adminServiceMock.updateManagedDocument).toHaveBeenCalledWith(
+      'namuwiki_documents',
+      77,
+      expect.objectContaining({
+        content: '라이츄'
+      })
+    )
+  })
+
+  it('deletes managed document', async () => {
+    adminServiceMock.deleteManagedDocument.mockResolvedValueOnce({
+      tableName: 'namuwiki_documents',
+      language: 'korean',
+      id: 77,
+      taskQueued: true,
+      taskType: 'delete'
+    })
+
+    const moduleRef = await createTestingModule()
+    const controller = moduleRef.get(AdminController)
+    const response = await controller.deleteManagedDocument('namuwiki_documents', '77')
+
+    expect(response.success).toBe(true)
+    expect(adminServiceMock.deleteManagedDocument).toHaveBeenCalledWith(
+      'namuwiki_documents',
+      77
+    )
+  })
+
+  it('streams bm25 indexing events over sse', async () => {
+    adminServiceMock.runBm25Indexing.mockImplementationOnce(
+      async (
+        language: string,
+        chunkSize: number,
+        emit: (event: { event: string; language: string; chunkSize: number }) => void
+      ) => {
+        emit({ event: 'started', language, chunkSize })
+        emit({ event: 'completed', language, chunkSize })
+      }
+    )
+
+    const request = {
+      on: jest.fn()
+    } as unknown as Request
+    const response = createSseResponseMock()
+
+    const moduleRef = await createTestingModule()
+    const controller = moduleRef.get(AdminController)
+    await controller.runBm25Indexing('korean', '25', request, response)
+
+    expect(response.setHeader).toHaveBeenCalledWith(
+      'Content-Type',
+      'text/event-stream'
+    )
+    expect(response.body.join('')).toContain('event: started')
+    expect(response.body.join('')).toContain('event: completed')
+    expect(adminServiceMock.runBm25Indexing).toHaveBeenCalledWith(
+      'korean',
+      25,
+      expect.any(Function),
+      expect.any(Function)
+    )
+    expect(response.end).toHaveBeenCalled()
+  })
+
+  it('rejects invalid chunk size before starting sse', async () => {
+    const request = {
+      on: jest.fn()
+    } as unknown as Request
+    const response = createSseResponseMock()
+
+    const moduleRef = await createTestingModule()
+    const controller = moduleRef.get(AdminController)
+    await controller.runBm25Indexing('korean', '0', request, response)
+
+    expect(response.status).toHaveBeenCalledWith(400)
+    expect(response.json).toHaveBeenCalledWith(
+      expect.objectContaining({
+        success: false,
+        error: 'chunkSize must be a positive integer'
+      })
+    )
+    expect(adminServiceMock.runBm25Indexing).not.toHaveBeenCalled()
   })
 })
