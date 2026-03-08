@@ -236,6 +236,8 @@ describe('AppController', () => {
       'queryVectorSource: runtime-query-embedding'
     )
     expect(response.data[0].learning.generatedSql).toContain('hybridRatio: 70')
+    expect(response.data[0].learning.generatedSql).toContain('candidatePool: 120')
+    expect(response.data[0].learning.generatedSql).toContain('bm25QueryText: arm')
     expect(response.data[0].learning.generatedSql).toContain('bm25TsQueryMode: plainto_tsquery')
     expect(response.data[0].learning.generatedSql).toContain('ranking: vector+bm25-hybrid')
     expect(response.data[0].learning.executionPlan['Node Type']).toBe('Limit')
@@ -346,6 +348,9 @@ describe('AppController', () => {
     expect(response.data[0].items[0].usedKeywords).toContain('래퍼')
     expect(response.data[0].items[0].usedKeywords).not.toContain('김승민래퍼')
     expect(response.data[0].learning.generatedSql).toContain('fallbackStrategy: bm25-only')
+    expect(response.data[0].learning.generatedSql).toContain('bm25QueryText:')
+    expect(response.data[0].learning.generatedSql).toContain('김승민')
+    expect(response.data[0].learning.generatedSql).toContain('래퍼')
     expect(response.data[0].learning.generatedSql).toContain(
       'fallbackReason: query-embedding-unavailable'
     )
@@ -472,6 +477,84 @@ describe('AppController', () => {
     expect(response.data[0].learning.generatedSql).toContain(
       'fallbackReason: ann-candidates-empty'
     )
+  })
+
+  it('falls back to lexical BM25 when ANN signal is weak for long natural language queries', async () => {
+    prismaServiceMock.$queryRawUnsafe
+      .mockResolvedValueOnce([{ available: true }])
+      .mockResolvedValueOnce([
+        {
+          id: BigInt(41),
+          title: '엉뚱한 결과',
+          snippet: '연관성이 낮은 문서 ...',
+          namespace: 'Etc',
+          contributors: 'user-y',
+          vector_distance: 1.8,
+          bm25_score: 0
+        }
+      ])
+      .mockResolvedValueOnce([{ total: BigInt(1) }])
+      .mockResolvedValueOnce([
+        {
+          'QUERY PLAN': [
+            {
+              Plan: {
+                'Node Type': 'Limit',
+                'Relation Name': 'namuwiki_document_embeddings_qwen',
+                'Total Cost': 20,
+                'Plan Rows': 1
+              }
+            }
+          ]
+        }
+      ])
+      .mockResolvedValueOnce([
+        {
+          id: BigInt(42),
+          title: '포켓몬스터/배틀',
+          snippet: '강한 포켓몬 설명 ...',
+          namespace: 'Game',
+          contributors: 'user-z',
+          bm25_score: 1.4,
+          title_match: true,
+          like_title_match: true,
+          like_content_match: true
+        }
+      ])
+      .mockResolvedValueOnce([{ total: BigInt(1) }])
+      .mockResolvedValueOnce([
+        {
+          'QUERY PLAN': [
+            {
+              Plan: {
+                'Node Type': 'Bitmap Heap Scan',
+                'Relation Name': 'namuwiki_documents',
+                'Total Cost': 18,
+                'Plan Rows': 1
+              }
+            }
+          ]
+        }
+      ])
+
+    const moduleRef = await createTestingModule()
+    const controller = moduleRef.get(AppController)
+    const response = await controller.searchHybrid({
+      query: '포켓몬스터에서 가장 강한 포켓몬',
+      offset: 0,
+      limit: 10,
+      mode: 'hnsw',
+      bm25Enabled: true,
+      hybridRatio: 53,
+      embeddingModel: 'qwen3'
+    })
+
+    expect(response.success).toBe(true)
+    expect(response.data[0].items[0].title).toBe('포켓몬스터/배틀')
+    expect(response.data[0].learning.generatedSql).toContain('fallbackReason: ann-signal-weak')
+    expect(response.data[0].learning.generatedSql).toContain('bm25QueryText:')
+    expect(response.data[0].learning.generatedSql).toContain('포켓몬스터')
+    expect(response.data[0].learning.generatedSql).toContain('포켓몬')
   })
 
   it('falls back to lexical LIKE search when bm25 is disabled and query embeddings are unavailable', async () => {

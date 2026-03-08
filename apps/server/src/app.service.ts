@@ -108,6 +108,14 @@ export class AppService {
   ] as const
   private static readonly KOREAN_POSTPOSITION_SUFFIX_PATTERN =
     /(은|는|이|가|을|를|의|에|에서|으로|로|와|과|에게|한테|께|도|만|부터|까지|처럼|보다|랑)$/u
+  private static readonly SHORT_QUERY_POOL_MULTIPLIER = 12
+  private static readonly DEFAULT_QUERY_POOL_MULTIPLIER = 9
+  private static readonly LONG_QUERY_POOL_MULTIPLIER = 6
+  private static readonly CANDIDATE_POOL_MAX = 120
+  private static readonly CANDIDATE_POOL_MIN_WINDOW = 10
+  private static readonly BM25_LONG_QUERY_MAX_TERMS = 3
+  private static readonly BM25_DEFAULT_MAX_TERMS = 4
+  private static readonly ANN_FALLBACK_MIN_TOP_SCORE = 0.34
 
   constructor(
     private readonly prismaService: PrismaService,
@@ -315,6 +323,7 @@ export class AppService {
     const isLongNaturalLanguageQuery = queryTerms.length >= 4 || normalizedQuery.length >= 16
     const keywordSignals = this.buildKeywordSignals(queryTerms, isLongNaturalLanguageQuery)
     const weightedKeywords = keywordSignals.map((signal) => signal.keyword)
+    const bm25QueryText = this.buildBm25QueryText(weightedKeywords, isLongNaturalLanguageQuery)
     const effectiveMode: 'hnsw' | 'ivf' = options.mode === 'ivf' ? 'ivf' : 'hnsw'
     const semanticWeight = options.bm25Enabled ? Number((options.hybridRatio / 100).toFixed(3)) : 1
     const keywordWeight = options.bm25Enabled ? Number((1 - semanticWeight).toFixed(3)) : 0
@@ -326,13 +335,12 @@ export class AppService {
       : 'namuwiki_documents d'
     const embeddingExpr = options.embeddingModel === 'qwen3' ? 'qe.embedding' : 'd.embedding'
     const distanceOperator = effectiveMode === 'ivf' ? '<#>' : '<=>'
-    const poolMultiplier =
-      queryTerms.length <= 1 && normalizedQuery.length <= 2
-        ? 25
-        : isLongNaturalLanguageQuery
-          ? 12
-          : 18
-    const candidatePool = Math.max(options.limit + options.offset, 20) * poolMultiplier
+    const candidatePool = this.resolveCandidatePool(
+      queryTerms,
+      normalizedQuery,
+      options.limit,
+      options.offset
+    )
 
     const annSql = `
       WITH ann_candidates AS (
@@ -429,6 +437,7 @@ export class AppService {
             query,
             normalizedQuery,
             queryPattern,
+            bm25QueryText,
             weightedKeywords,
             keywordSignals,
             options,
@@ -473,7 +482,7 @@ export class AppService {
           queryVector,
           candidatePool,
           options.bm25Enabled,
-          normalizedQuery,
+          bm25QueryText,
           semanticWeight,
           keywordWeight,
           effectiveMode === 'ivf',
@@ -491,7 +500,7 @@ export class AppService {
               queryVector,
               candidatePool,
               options.bm25Enabled,
-              normalizedQuery,
+              bm25QueryText,
               semanticWeight,
               keywordWeight,
               effectiveMode === 'ivf',
@@ -509,11 +518,29 @@ export class AppService {
         ((countRows as Array<{ total: bigint }>)[0]?.total ?? BigInt(0)).toString()
       )
 
-      if ((rows.length === 0 || total === 0) && options.bm25Enabled) {
+      const annPreviewItems = rows.map((row) =>
+        this.mapHybridRowToSearchResult(
+          row,
+          weightedKeywords,
+          effectiveMode,
+          semanticWeight,
+          keywordWeight
+        )
+      )
+
+      const weakAnnSignal = this.shouldFallbackFromWeakAnn(
+        annPreviewItems,
+        options.limit,
+        isLongNaturalLanguageQuery,
+        options.bm25Enabled
+      )
+
+      if (((rows.length === 0 || total === 0) || weakAnnSignal) && options.bm25Enabled) {
         return this.searchHybridLexicalFallback(
           query,
           normalizedQuery,
           queryPattern,
+          bm25QueryText,
           weightedKeywords,
           keywordSignals,
           options,
@@ -522,7 +549,7 @@ export class AppService {
           seedLookupMs,
           seedLookupAttempts,
           pipelineStartedAt,
-          'ann-candidates-empty'
+          weakAnnSignal ? 'ann-signal-weak' : 'ann-candidates-empty'
         )
       }
 
@@ -532,36 +559,7 @@ export class AppService {
       const queryExplanation = includeExplain
         ? `${this.buildQueryExplanation(executionPlan)} Used model-generated query embedding. Keywords used: ${weightedKeywords.join(', ') || 'none'}.`
         : `Execution plan omitted because SEARCH_INCLUDE_EXPLAIN is disabled. Used model-generated query embedding. Keywords used: ${weightedKeywords.join(', ') || 'none'}.`
-
-      const mappedItems = rows.map((row) => {
-          const vectorScore = this.toUnitInterval(
-            effectiveMode === 'ivf'
-              ? Number(((-row.vector_distance + 1) / 2).toFixed(3))
-              : Number((1 - row.vector_distance / 2).toFixed(3))
-          )
-          const bm25Score = this.toUnitInterval(
-            Number(((row.bm25_score ?? 0) / (1 + (row.bm25_score ?? 0))).toFixed(3))
-          )
-          const score = this.toUnitInterval(
-            Number((vectorScore * semanticWeight + bm25Score * keywordWeight).toFixed(3))
-          )
-
-          return {
-            id: Number(row.id),
-            title: row.title ?? 'Untitled Document',
-              snippet: row.snippet,
-              score,
-              category: row.namespace ?? 'Unknown',
-              distance: Number((1 - score).toFixed(4)),
-              tags: this.toTags(row.contributors),
-              matchRate: Number((score * 100).toFixed(1)),
-              usedKeywords: weightedKeywords,
-              matchedKeywords: this.findMatchedKeywords(
-                weightedKeywords,
-                `${row.title ?? ''} ${row.snippet}`
-              )
-            }
-          })
+      const mappedItems = annPreviewItems
       const resultAssembleMs = Date.now() - resultAssembleStartedAt
 
       return {
@@ -569,7 +567,7 @@ export class AppService {
         total,
         learning: {
           generatedSql:
-            `${annSql.trim()}\n-- queryVectorSource: runtime-query-embedding, queryEmbedding: ${queryEmbeddingReason}, embeddingModel: ${options.embeddingModel}, requestedMode: ${options.mode}, effectiveMode: ${effectiveMode}, bm25: ${options.bm25Enabled}, hybridRatio: ${options.hybridRatio}, candidatePool: ${candidatePool}, tsConfig: ${tsConfig}, ranking: ${rankingStrategy}, rankTsQuery: ${weightedKeywords.join(' ') || 'none'}, bm25TsQueryMode: plainto_tsquery`,
+            `${annSql.trim()}\n-- queryVectorSource: runtime-query-embedding, queryEmbedding: ${queryEmbeddingReason}, embeddingModel: ${options.embeddingModel}, requestedMode: ${options.mode}, effectiveMode: ${effectiveMode}, bm25: ${options.bm25Enabled}, hybridRatio: ${options.hybridRatio}, candidatePool: ${candidatePool}, tsConfig: ${tsConfig}, ranking: ${rankingStrategy}, rankTsQuery: ${weightedKeywords.join(' ') || 'none'}, bm25QueryText: ${bm25QueryText || 'none'}, bm25TsQueryMode: plainto_tsquery`,
           executionPlan,
           queryExplanation,
           keywordSignals,
@@ -590,6 +588,7 @@ export class AppService {
           query,
           normalizedQuery,
           queryPattern,
+          bm25QueryText,
           weightedKeywords,
           keywordSignals,
           options,
@@ -610,6 +609,7 @@ export class AppService {
     query: string,
     normalizedQuery: string,
     queryPattern: string,
+    bm25QueryText: string,
     weightedKeywords: string[],
     keywordSignals: SearchKeywordSignal[],
     options: SearchHybridOptions,
@@ -691,7 +691,7 @@ export class AppService {
       const [rawRows, countRows, planRows] = await Promise.all([
         this.prismaService.$queryRawUnsafe(
           fallbackSql,
-          normalizedQuery,
+          bm25QueryText,
           queryPattern,
           queryPattern,
           options.limit,
@@ -699,14 +699,14 @@ export class AppService {
         ),
         this.prismaService.$queryRawUnsafe(
           fallbackCountSql,
-          normalizedQuery,
+          bm25QueryText,
           queryPattern,
           queryPattern
         ),
         includeExplain
           ? this.prismaService.$queryRawUnsafe(
               explainSql,
-              normalizedQuery,
+              bm25QueryText,
               queryPattern,
               queryPattern,
               options.limit,
@@ -765,7 +765,7 @@ export class AppService {
         total,
         learning: {
           generatedSql:
-            `${fallbackSql.trim()}\n-- fallbackStrategy: bm25-only, fallbackReason: ${fallbackReason}, embeddingModel: ${options.embeddingModel}, requestedMode: ${options.mode}, bm25: ${options.bm25Enabled}, hybridRatio: ${options.hybridRatio}, rankTsQuery: ${weightedKeywords.join(' ') || 'none'}`,
+            `${fallbackSql.trim()}\n-- fallbackStrategy: bm25-only, fallbackReason: ${fallbackReason}, embeddingModel: ${options.embeddingModel}, requestedMode: ${options.mode}, bm25: ${options.bm25Enabled}, hybridRatio: ${options.hybridRatio}, rankTsQuery: ${weightedKeywords.join(' ') || 'none'}, bm25QueryText: ${bm25QueryText || 'none'}`,
           executionPlan,
           queryExplanation,
           keywordSignals,
@@ -938,6 +938,94 @@ export class AppService {
     const strippedTerm = sanitizedTerm.replace(AppService.KOREAN_POSTPOSITION_SUFFIX_PATTERN, '')
 
     return strippedTerm || sanitizedTerm
+  }
+
+  private buildBm25QueryText(
+    weightedKeywords: string[],
+    isLongNaturalLanguageQuery: boolean
+  ): string {
+    const maxTerms = isLongNaturalLanguageQuery
+      ? AppService.BM25_LONG_QUERY_MAX_TERMS
+      : AppService.BM25_DEFAULT_MAX_TERMS
+
+    return weightedKeywords.slice(0, maxTerms).join(' ').trim()
+  }
+
+  private resolveCandidatePool(
+    queryTerms: string[],
+    normalizedQuery: string,
+    limit: number,
+    offset: number
+  ): number {
+    const requestWindow = Math.max(
+      limit + offset,
+      limit,
+      AppService.CANDIDATE_POOL_MIN_WINDOW
+    )
+    const isShortKeywordQuery = queryTerms.length <= 2 && normalizedQuery.length <= 12
+    const isLongNaturalLanguageQuery = queryTerms.length >= 4 || normalizedQuery.length >= 16
+    const poolMultiplier = isShortKeywordQuery
+      ? AppService.SHORT_QUERY_POOL_MULTIPLIER
+      : isLongNaturalLanguageQuery
+        ? AppService.LONG_QUERY_POOL_MULTIPLIER
+        : AppService.DEFAULT_QUERY_POOL_MULTIPLIER
+
+    return Math.min(requestWindow * poolMultiplier, AppService.CANDIDATE_POOL_MAX)
+  }
+
+  private mapHybridRowToSearchResult(
+    row: HybridSearchRow,
+    weightedKeywords: string[],
+    effectiveMode: 'hnsw' | 'ivf',
+    semanticWeight: number,
+    keywordWeight: number
+  ): SearchResult {
+    const vectorScore = this.toUnitInterval(
+      effectiveMode === 'ivf'
+        ? Number(((-row.vector_distance + 1) / 2).toFixed(3))
+        : Number((1 - row.vector_distance / 2).toFixed(3))
+    )
+    const bm25Score = this.toUnitInterval(
+      Number(((row.bm25_score ?? 0) / (1 + (row.bm25_score ?? 0))).toFixed(3))
+    )
+    const score = this.toUnitInterval(
+      Number((vectorScore * semanticWeight + bm25Score * keywordWeight).toFixed(3))
+    )
+
+    return {
+      id: Number(row.id),
+      title: row.title ?? 'Untitled Document',
+      snippet: row.snippet,
+      score,
+      category: row.namespace ?? 'Unknown',
+      distance: Number((1 - score).toFixed(4)),
+      tags: this.toTags(row.contributors),
+      matchRate: Number((score * 100).toFixed(1)),
+      usedKeywords: weightedKeywords,
+      matchedKeywords: this.findMatchedKeywords(
+        weightedKeywords,
+        `${row.title ?? ''} ${row.snippet}`
+      )
+    }
+  }
+
+  private shouldFallbackFromWeakAnn(
+    items: SearchResult[],
+    limit: number,
+    isLongNaturalLanguageQuery: boolean,
+    bm25Enabled: boolean
+  ): boolean {
+    if (!bm25Enabled || !isLongNaturalLanguageQuery || items.length === 0) {
+      return false
+    }
+
+    const topScore = items[0]?.score ?? 0
+    const minimumExpectedItems = Math.min(limit, 3)
+
+    return (
+      topScore < AppService.ANN_FALLBACK_MIN_TOP_SCORE ||
+      items.length < minimumExpectedItems
+    )
   }
 
   private buildKeywordSignals(
