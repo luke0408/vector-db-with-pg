@@ -44,6 +44,8 @@ export interface SearchMeta {
   tookMs?: number
   requestId?: string
   embeddingModelUsed?: 'base' | 'qwen3'
+  tableNameUsed?: string
+  languageUsed?: string
 }
 
 export interface SearchResponse {
@@ -56,6 +58,7 @@ export interface SearchResponse {
 export interface SearchRequestOptions {
   offset?: number
   limit?: number
+  tableName?: string
   useHybrid?: boolean
   mode?: 'none' | 'hnsw' | 'ivf'
   bm25Enabled?: boolean
@@ -173,10 +176,11 @@ export async function searchDocuments(
     query,
     offset: options.offset ?? 0,
     limit: options.limit ?? 20,
+    tableName: options.tableName,
     mode: options.mode ?? 'none',
     bm25Enabled: options.bm25Enabled ?? true,
     hybridRatio: options.hybridRatio ?? 50,
-    embeddingModel: options.embeddingModel ?? 'base'
+    embeddingModel: options.embeddingModel ?? 'qwen3'
   }
 
   const endpoint = options.useHybrid ? '/api/search/hybrid' : '/api/search'

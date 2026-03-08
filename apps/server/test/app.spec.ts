@@ -135,7 +135,7 @@ describe('AppController', () => {
     expect(response.data[0].items).toHaveLength(1)
     expect(response.data[0].learning.generatedSql).toContain('SELECT')
     expect(response.data[0].learning.executionPlan['Node Type']).toBe('Index Scan')
-    expect(response.meta?.embeddingModelUsed).toBe('base')
+    expect(response.meta?.embeddingModelUsed).toBe('qwen3')
     expect(response.meta).toEqual(
       expect.objectContaining({
         total: 1,
@@ -229,7 +229,7 @@ describe('AppController', () => {
       hybridRatio: 70
     })
 
-    expect(queryEmbeddingServiceMock.embedQuery).toHaveBeenCalledWith('ARM', 'base')
+    expect(queryEmbeddingServiceMock.embedQuery).toHaveBeenCalledWith('ARM', 'qwen3')
     expect(response.success).toBe(true)
     expect(response.data[0].items).toHaveLength(1)
     expect(response.data[0].learning.generatedSql).toContain(
@@ -238,7 +238,7 @@ describe('AppController', () => {
     expect(response.data[0].learning.generatedSql).toContain('hybridRatio: 70')
     expect(response.data[0].learning.generatedSql).toContain('candidatePool: 120')
     expect(response.data[0].learning.generatedSql).toContain('bm25QueryText: arm')
-    expect(response.data[0].learning.generatedSql).toContain('bm25TsQueryMode: plainto_tsquery')
+    expect(response.data[0].learning.generatedSql).toContain('bm25Tokens: arm')
     expect(response.data[0].learning.generatedSql).toContain('ranking: vector+bm25-hybrid')
     expect(response.data[0].learning.executionPlan['Node Type']).toBe('Limit')
     expect(response.data[0].learning.keywordSignals?.[0]?.keyword).toBe('arm')
@@ -407,7 +407,7 @@ describe('AppController', () => {
     expect(response.data[0].items[0].title).toBe('인사 안내')
     expect(response.data[0].learning.generatedSql).toContain('fallbackStrategy: bm25-only')
     expect(response.data[0].learning.generatedSql).toContain(
-      'fallbackReason: embedding-store-empty:base'
+      'fallbackReason: embedding-store-empty:namuwiki_documents'
     )
   })
 

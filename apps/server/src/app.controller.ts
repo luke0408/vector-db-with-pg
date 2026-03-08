@@ -33,6 +33,7 @@ interface ParsedSearchRequest {
   query: string
   offset: number
   limit: number
+  tableName?: string
   embeddingModel: EmbeddingModel
 }
 
@@ -110,6 +111,7 @@ export class AppController {
       const options: SearchQueryOptions = {
         offset: request.offset,
         limit: request.limit,
+        tableName: request.tableName,
         embeddingModel: request.embeddingModel
       }
       const results = await this.appService.search(request.query, options)
@@ -128,7 +130,8 @@ export class AppController {
           offset: options.offset,
           limit: options.limit,
           tookMs,
-          embeddingModelUsed: options.embeddingModel
+          embeddingModelUsed: options.embeddingModel,
+          tableNameUsed: options.tableName ?? 'namuwiki_documents'
         }
       }
     } catch {
@@ -141,7 +144,8 @@ export class AppController {
           offset: request.offset,
           limit: request.limit,
           tookMs: Date.now() - startedAt,
-          embeddingModelUsed: request.embeddingModel
+          embeddingModelUsed: request.embeddingModel,
+          tableNameUsed: request.tableName ?? 'namuwiki_documents'
         }
       }
     }
@@ -168,6 +172,7 @@ export class AppController {
       const options: SearchHybridOptions = {
         offset: request.offset,
         limit: request.limit,
+        tableName: request.tableName,
         mode: request.mode,
         bm25Enabled: request.bm25Enabled,
         hybridRatio: request.hybridRatio,
@@ -190,7 +195,8 @@ export class AppController {
           offset: options.offset,
           limit: options.limit,
           tookMs,
-          embeddingModelUsed: options.embeddingModel
+          embeddingModelUsed: options.embeddingModel,
+          tableNameUsed: options.tableName ?? 'namuwiki_documents'
         }
       }
     } catch {
@@ -203,7 +209,8 @@ export class AppController {
           offset: request.offset,
           limit: request.limit,
           tookMs: Date.now() - startedAt,
-          embeddingModelUsed: request.embeddingModel
+          embeddingModelUsed: request.embeddingModel,
+          tableNameUsed: request.tableName ?? 'namuwiki_documents'
         }
       }
     }
@@ -220,7 +227,7 @@ export class AppController {
           query: '',
           offset: 0,
           limit: 20,
-          embeddingModel: 'base'
+          embeddingModel: 'qwen3'
         },
         error: 'query must be provided as string'
       }
@@ -234,7 +241,7 @@ export class AppController {
           query: '',
           offset: 0,
           limit: 20,
-          embeddingModel: 'base'
+          embeddingModel: 'qwen3'
         },
         error: 'query is required'
       }
@@ -246,7 +253,7 @@ export class AppController {
           query: '',
           offset: 0,
           limit: 20,
-          embeddingModel: 'base'
+          embeddingModel: 'qwen3'
         },
         error: 'query length must be 200 or fewer'
       }
@@ -254,7 +261,7 @@ export class AppController {
 
     const offset = this.toIntOrDefault(rawRequest.offset, 0)
     const limit = this.toIntOrDefault(rawRequest.limit, 20)
-    const embeddingModel = rawRequest.embeddingModel ?? 'base'
+    const embeddingModel = rawRequest.embeddingModel ?? 'qwen3'
 
     if (embeddingModel !== 'base' && embeddingModel !== 'qwen3') {
       return {
@@ -262,7 +269,8 @@ export class AppController {
           query: normalizedQuery,
           offset,
           limit,
-          embeddingModel: 'base'
+          tableName: rawRequest.tableName?.trim() || undefined,
+          embeddingModel: 'qwen3'
         },
         error: 'embeddingModel must be one of base, qwen3'
       }
@@ -274,6 +282,7 @@ export class AppController {
           query: normalizedQuery,
           offset: 0,
           limit: 20,
+          tableName: rawRequest.tableName?.trim() || undefined,
           embeddingModel
         },
         error: 'offset must be 0 or greater'
@@ -286,6 +295,7 @@ export class AppController {
           query: normalizedQuery,
           offset,
           limit: 20,
+          tableName: rawRequest.tableName?.trim() || undefined,
           embeddingModel
         },
         error: 'limit must be between 1 and 100'
@@ -297,6 +307,7 @@ export class AppController {
         query: normalizedQuery,
         offset,
         limit,
+        tableName: rawRequest.tableName?.trim() || undefined,
         embeddingModel
       }
     }
@@ -319,7 +330,7 @@ export class AppController {
           mode: 'none',
           bm25Enabled: true,
           hybridRatio: 50,
-          embeddingModel: 'base'
+          embeddingModel: 'qwen3'
         },
         error: parsedSearch.error
       }
@@ -332,7 +343,7 @@ export class AppController {
       rawRequest?.hybridRatio,
       50
     )
-    const embeddingModel = rawRequest?.embeddingModel ?? 'base'
+    const embeddingModel = rawRequest?.embeddingModel ?? 'qwen3'
 
     if (!this.isSearchMode(mode)) {
       return {
@@ -354,7 +365,7 @@ export class AppController {
           mode,
           bm25Enabled,
           hybridRatio,
-          embeddingModel: 'base'
+          embeddingModel: 'qwen3'
         },
         error: 'embeddingModel must be one of base, qwen3'
       }
@@ -392,9 +403,10 @@ export class AppController {
     const raw = value as Record<string, unknown>
 
     return {
-      query: typeof raw.query === 'string' ? raw.query : undefined,
+          query: typeof raw.query === 'string' ? raw.query : undefined,
       offset: this.pickOptionalNumber(raw, 'offset'),
       limit: this.pickOptionalNumber(raw, 'limit'),
+      tableName: this.pickOptionalString(raw, 'tableName'),
       embeddingModel: this.pickOptionalString(raw, 'embeddingModel') as
         | EmbeddingModel
         | undefined

@@ -7,6 +7,7 @@ export interface SearchRequest {
   query: string & tags.MinLength<1> & tags.MaxLength<200>
   offset?: number & tags.Type<'int32'> & tags.Minimum<0>
   limit?: number & tags.Type<'int32'> & tags.Minimum<1> & tags.Maximum<100>
+  tableName?: string
   embeddingModel?: EmbeddingModel
 }
 
@@ -23,6 +24,8 @@ export interface ApiMeta {
   tookMs?: number
   requestId?: string
   embeddingModelUsed?: EmbeddingModel
+  tableNameUsed?: string
+  languageUsed?: string
 }
 
 export interface ApiResponse<T> {

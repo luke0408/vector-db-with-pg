@@ -273,18 +273,20 @@ describe('App', () => {
       expect.objectContaining({
         offset: 0,
         limit: 10,
+        tableName: 'namuwiki_documents',
         mode: 'none',
         bm25Enabled: true,
         hybridRatio: 50,
-        embeddingModel: 'base'
+        embeddingModel: 'qwen3'
       })
     )
   })
 
-  it('sends selected embedding model when toggled', async () => {
+  it('sends selected managed table when changed', async () => {
     render(<App />)
 
-    fireEvent.click(screen.getByRole('button', { name: 'QWEN3 (1024)' }))
+    const tableSelect = screen.getByDisplayValue('namuwiki_documents')
+    fireEvent.change(tableSelect, { target: { value: 'namuwiki_documents' } })
 
     const input = screen.getByPlaceholderText('Search across NamuWiki articles...')
     fireEvent.change(input, { target: { value: 'vector db' } })
@@ -297,6 +299,7 @@ describe('App', () => {
     expect(mockedSearchDocuments).toHaveBeenCalledWith(
       'vector db',
       expect.objectContaining({
+        tableName: 'namuwiki_documents',
         embeddingModel: 'qwen3'
       })
     )
@@ -351,7 +354,7 @@ describe('App', () => {
 
     await waitFor(() => {
       expect(mockedListAdminLanguages).toHaveBeenCalledTimes(1)
-      expect(mockedListManagedTables).toHaveBeenCalledTimes(1)
+      expect(mockedListManagedTables.mock.calls.length).toBeGreaterThanOrEqual(1)
     })
 
     await waitFor(() => {

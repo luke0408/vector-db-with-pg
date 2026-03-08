@@ -24,7 +24,6 @@ import {
 import { formatSnippet } from './lib/snippet-format'
 
 type SearchMode = 'none' | 'hnsw' | 'ivf'
-type EmbeddingModel = 'base' | 'qwen3'
 type ViewMode = 'search' | 'admin'
 type IndexingRunState = {
   isRunning: boolean
@@ -73,7 +72,7 @@ export function App() {
   const [searchMode, setSearchMode] = useState<SearchMode>('none')
   const [bm25Enabled, setBm25Enabled] = useState(true)
   const [hybridRatio, setHybridRatio] = useState(50)
-  const [embeddingModel, setEmbeddingModel] = useState<EmbeddingModel>('base')
+  const [selectedTableName, setSelectedTableName] = useState('namuwiki_documents')
   const [showSql, setShowSql] = useState(true)
   const [showPlan, setShowPlan] = useState(false)
   const [showExplanation, setShowExplanation] = useState(true)
@@ -130,6 +129,10 @@ export function App() {
   )
 
   useEffect(() => {
+    void loadManagedTablesForSearch()
+  }, [])
+
+  useEffect(() => {
     if (viewMode !== 'admin') {
       return
     }
@@ -179,11 +182,12 @@ export function App() {
     const response = await searchDocuments(query, {
       offset: nextOffset,
       limit,
+      tableName: selectedTableName,
       useHybrid,
       mode: searchMode,
       bm25Enabled,
       hybridRatio,
-      embeddingModel
+      embeddingModel: 'qwen3'
     })
 
     if (!response.success) {
@@ -210,6 +214,22 @@ export function App() {
     setIsLoading(false)
   }
 
+  const loadManagedTablesForSearch = async () => {
+    const response = await listManagedTables()
+
+    if (!response.success) {
+      return
+    }
+
+    setManagedTables(response.data)
+
+    const nextDefaultTable =
+      response.data.find((table) => table.isDefault)?.tableName ??
+      response.data[0]?.tableName ??
+      'namuwiki_documents'
+    setSelectedTableName((current) => current || nextDefaultTable)
+  }
+
   const loadAdminOverview = async () => {
     setAdminLoading(true)
     setAdminError(null)
@@ -233,6 +253,11 @@ export function App() {
 
     setLanguages(languageResponse.data)
     setManagedTables(tableResponse.data)
+    setSelectedTableName(
+      tableResponse.data.find((table) => table.isDefault)?.tableName ??
+        tableResponse.data[0]?.tableName ??
+        'namuwiki_documents'
+    )
 
     if (languageResponse.data.length > 0) {
       const nextLanguage =
@@ -499,19 +524,22 @@ export function App() {
                 </div>
 
                 <div className="config-block">
-                  <p className="block-label">Embedding Model</p>
-                  <div className="mode-switch">
-                    {(['base', 'qwen3'] as const).map((model) => (
-                      <button
-                        key={model}
-                        type="button"
-                        className={embeddingModel === model ? 'mode active' : 'mode'}
-                        onClick={() => setEmbeddingModel(model)}
-                      >
-                        {model === 'base' ? 'BASE (384)' : 'QWEN3 (1024)'}
-                      </button>
-                    ))}
-                  </div>
+                  <p className="block-label">Managed Table</p>
+                  <select
+                    className="search-table-select"
+                    value={selectedTableName}
+                    onChange={(event) => setSelectedTableName(event.target.value)}
+                  >
+                    {managedTables.length > 0 ? (
+                      managedTables.map((table) => (
+                        <option key={table.tableName} value={table.tableName}>
+                          {table.tableName}
+                        </option>
+                      ))
+                    ) : (
+                      <option value="namuwiki_documents">namuwiki_documents</option>
+                    )}
+                  </select>
                 </div>
 
                 <div className="config-block inline-toggle">

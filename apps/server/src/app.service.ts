@@ -47,6 +47,7 @@ export interface SearchResponseData {
 export interface SearchQueryOptions {
   offset: number
   limit: number
+  tableName?: string
   embeddingModel?: EmbeddingModel
 }
 
@@ -55,6 +56,24 @@ export interface SearchHybridOptions extends SearchQueryOptions {
   bm25Enabled: boolean
   hybridRatio: number
   embeddingModel: EmbeddingModel
+}
+
+interface ManagedSearchContext {
+  tableName: string
+  language: string
+  tableSuffix: string
+  idColumn: string
+  docHashColumn: string | null
+  titleColumn: string
+  contentColumn: string
+  textlenColumn: string
+  ftsColumn: string
+  embeddingColumn: string
+  embeddingHnswColumn: string
+  k1: number
+  b: number
+  supportsLegacyNamespace: boolean
+  supportsLegacyContributors: boolean
 }
 
 interface HybridSearchRow {
@@ -151,6 +170,7 @@ export class AppService {
     options: SearchQueryOptions
   ): Promise<SearchExecutionResult> {
     const normalizedQuery = query.trim().toLowerCase()
+    const tableContext = await this.resolveManagedSearchContext(options.tableName)
 
     if (!normalizedQuery) {
       return {
@@ -174,30 +194,47 @@ export class AppService {
     }
 
     const queryPattern = `%${normalizedQuery}%`
+    const tableSql = this.quoteIdentifier(tableContext.tableName)
+    const idColumnSql = this.columnRef('d', tableContext.idColumn)
+    const titleColumnSql = this.columnRef('d', tableContext.titleColumn)
+    const contentColumnSql = this.columnRef('d', tableContext.contentColumn)
+    const snippetExpr = `LEFT(${contentColumnSql}, 240)`
+    const namespaceExpr = tableContext.supportsLegacyNamespace
+      ? 'd.namespace'
+      : `${this.sqlStringLiteral(tableContext.tableName)}`
+    const contributorsExpr = tableContext.supportsLegacyContributors
+      ? 'd.contributors'
+      : `NULL::text`
+    const ftsExpr = this.buildSearchVectorExpression(tableContext, 'd')
+    const languageLiteral = this.sqlStringLiteral(tableContext.language)
+
     const searchSql = `
       SELECT
-        id,
-        title,
-        LEFT(content, 240) AS snippet,
-        namespace,
-        contributors,
+        ${idColumnSql} AS id,
+        ${titleColumnSql} AS title,
+        ${snippetExpr} AS snippet,
+        ${namespaceExpr} AS namespace,
+        ${contributorsExpr} AS contributors,
         CASE
-          WHEN LOWER(COALESCE(title, '')) LIKE $1 THEN 0.984
-          WHEN LOWER(content) LIKE $2 THEN 0.891
+          WHEN LOWER(COALESCE(${titleColumnSql}, '')) LIKE $1 THEN 0.984
+          WHEN ${ftsExpr} @@ plainto_tsquery(${languageLiteral}, $2) THEN 0.891
+          WHEN LOWER(${contentColumnSql}) LIKE $3 THEN 0.723
           ELSE 0.723
         END AS score
-      FROM namuwiki_documents
-      WHERE LOWER(COALESCE(title, '')) LIKE $3
-         OR LOWER(content) LIKE $4
+      FROM ${tableSql} d
+      WHERE LOWER(COALESCE(${titleColumnSql}, '')) LIKE $3
+         OR ${ftsExpr} @@ plainto_tsquery(${languageLiteral}, $2)
+         OR LOWER(${contentColumnSql}) LIKE $4
       ORDER BY score DESC, id DESC
       LIMIT $5 OFFSET $6
     `
 
     const countSql = `
       SELECT COUNT(*)::bigint AS total
-      FROM namuwiki_documents
-      WHERE LOWER(COALESCE(title, '')) LIKE $1
-         OR LOWER(content) LIKE $2
+      FROM ${tableSql} d
+      WHERE LOWER(COALESCE(${titleColumnSql}, '')) LIKE $1
+         OR ${ftsExpr} @@ plainto_tsquery(${languageLiteral}, $3)
+         OR LOWER(${contentColumnSql}) LIKE $2
     `
 
     const explainSql = `EXPLAIN (FORMAT JSON) ${searchSql}`
@@ -208,18 +245,18 @@ export class AppService {
         this.prismaService.$queryRawUnsafe(
           searchSql,
           queryPattern,
-          queryPattern,
+          normalizedQuery,
           queryPattern,
           queryPattern,
           options.limit,
           options.offset
         ),
-        this.prismaService.$queryRawUnsafe(countSql, queryPattern, queryPattern),
+        this.prismaService.$queryRawUnsafe(countSql, queryPattern, queryPattern, normalizedQuery),
         includeExplain
           ? this.prismaService.$queryRawUnsafe(
               explainSql,
               queryPattern,
-              queryPattern,
+              normalizedQuery,
               queryPattern,
               queryPattern,
               options.limit,
@@ -256,7 +293,7 @@ export class AppService {
             title: row.title ?? 'Untitled Document',
             snippet: row.snippet,
             score,
-            category: row.namespace ?? 'Unknown',
+            category: row.namespace ?? tableContext.tableName,
             distance: Number((1 - score).toFixed(4)),
             tags: this.toTags(row.contributors),
             matchRate: Number((score * 100).toFixed(1))
@@ -264,9 +301,10 @@ export class AppService {
         }),
         total,
         learning: {
-          generatedSql: searchSql.trim(),
+          generatedSql: `${searchSql.trim()}
+-- managedTable: ${tableContext.tableName}, language: ${tableContext.language}`,
           executionPlan,
-          queryExplanation
+          queryExplanation: `${queryExplanation} Managed table: ${tableContext.tableName}. Language: ${tableContext.language}.`
         }
       }
     } catch (error) {
@@ -280,7 +318,8 @@ export class AppService {
   ): Promise<SearchExecutionResult> {
     const pipelineStartedAt = Date.now()
     const analyzeStartedAt = Date.now()
-    const tsConfig = 'korean'
+    const tableContext = await this.resolveManagedSearchContext(options.tableName)
+    const tsConfig = tableContext.language
     const trimmedQuery = query.trim()
     const normalizedQuery = trimmedQuery.toLowerCase()
 
@@ -300,10 +339,10 @@ export class AppService {
     const queryTerms = this.extractQueryTerms(normalizedQuery)
 
     if (queryTerms.length === 0) {
-        return {
-          items: [],
-          total: 0,
-          learning: {
+      return {
+        items: [],
+        total: 0,
+        learning: {
           generatedSql: '-- query has no indexable keywords after normalization',
           executionPlan: {},
           queryExplanation: 'Query normalization produced no searchable keywords.',
@@ -324,16 +363,36 @@ export class AppService {
     const keywordSignals = this.buildKeywordSignals(queryTerms, isLongNaturalLanguageQuery)
     const weightedKeywords = keywordSignals.map((signal) => signal.keyword)
     const bm25QueryText = this.buildBm25QueryText(weightedKeywords, isLongNaturalLanguageQuery)
+    const bm25Tokens = await this.tokenizeForSearch(
+      tsConfig,
+      bm25QueryText || normalizedQuery,
+      weightedKeywords
+    )
     const effectiveMode: 'hnsw' | 'ivf' = options.mode === 'ivf' ? 'ivf' : 'hnsw'
     const semanticWeight = options.bm25Enabled ? Number((options.hybridRatio / 100).toFixed(3)) : 1
     const keywordWeight = options.bm25Enabled ? Number((1 - semanticWeight).toFixed(3)) : 0
     const rankingStrategy = options.bm25Enabled ? 'vector+bm25-hybrid' : 'vector-distance-only'
     const normalizeAndAnalyzeMs = Date.now() - analyzeStartedAt
-
-    const sourceJoin = options.embeddingModel === 'qwen3'
-      ? 'namuwiki_document_embeddings_qwen qe JOIN namuwiki_documents d ON d.doc_hash = qe.doc_hash'
-      : 'namuwiki_documents d'
-    const embeddingExpr = options.embeddingModel === 'qwen3' ? 'qe.embedding' : 'd.embedding'
+    const sourceJoin = this.buildHybridSourceJoin(tableContext)
+    const embeddingExpr = this.buildEmbeddingExpression(tableContext)
+    const tableSql = this.quoteIdentifier(tableContext.tableName)
+    const idColumnSql = this.columnRef('d', tableContext.idColumn)
+    const titleColumnSql = this.columnRef('d', tableContext.titleColumn)
+    const contentColumnSql = this.columnRef('d', tableContext.contentColumn)
+    const textlenColumnSql = this.columnRef('d', tableContext.textlenColumn)
+    const snippetExpr = `LEFT(${contentColumnSql}, 240)`
+    const namespaceExpr = tableContext.supportsLegacyNamespace
+      ? 'd.namespace'
+      : `${this.sqlStringLiteral(tableContext.tableName)}`
+    const contributorsExpr = tableContext.supportsLegacyContributors
+      ? 'd.contributors'
+      : 'NULL::text'
+    const bm25ScoreExpr = this.buildBm25ScoreExpression(
+      tableContext,
+      idColumnSql,
+      textlenColumnSql,
+      4
+    )
     const distanceOperator = effectiveMode === 'ivf' ? '<#>' : '<=>'
     const candidatePool = this.resolveCandidatePool(
       queryTerms,
@@ -345,7 +404,7 @@ export class AppService {
     const annSql = `
       WITH ann_candidates AS (
         SELECT
-          d.id AS id,
+          ${idColumnSql} AS id,
           ${embeddingExpr} ${distanceOperator} $1::vector AS vector_distance
         FROM ${sourceJoin}
         WHERE ${embeddingExpr} IS NOT NULL
@@ -354,19 +413,18 @@ export class AppService {
       ),
       ranked_candidates AS (
         SELECT
-          d.id,
-          d.title,
-          LEFT(d.content, 240) AS snippet,
-          d.namespace,
-          d.contributors,
+          ${idColumnSql} AS id,
+          ${titleColumnSql} AS title,
+          ${snippetExpr} AS snippet,
+          ${namespaceExpr} AS namespace,
+          ${contributorsExpr} AS contributors,
           ann_candidates.vector_distance,
           CASE
-            WHEN $3::boolean = true
-              THEN ts_rank_cd(COALESCE(d.search_vector, ''::tsvector), plainto_tsquery('${tsConfig}', $4), 32)
+            WHEN $3::boolean = true THEN ${bm25ScoreExpr}
             ELSE 0
           END AS bm25_score
         FROM ann_candidates
-        JOIN namuwiki_documents d ON d.id = ann_candidates.id
+        JOIN ${tableSql} d ON ${idColumnSql} = ann_candidates.id
       )
       SELECT
         id,
@@ -402,7 +460,7 @@ export class AppService {
 
     const annCountSql = `
       WITH ann_candidates AS (
-        SELECT d.id AS id
+        SELECT ${idColumnSql} AS id
         FROM ${sourceJoin}
         WHERE ${embeddingExpr} IS NOT NULL
         ORDER BY ${embeddingExpr} ${distanceOperator} $1::vector
@@ -417,11 +475,11 @@ export class AppService {
 
     try {
       const vectorPreparationStartedAt = Date.now()
-      const embeddingsAvailable = await this.hasEmbeddings(options.embeddingModel)
+      const embeddingsAvailable = await this.hasEmbeddingsForContext(tableContext)
       const queryEmbeddingAttempt = embeddingsAvailable
         ? await this.queryEmbeddingService.embedQuery(trimmedQuery, options.embeddingModel)
         : {
-            reason: `embedding-store-empty:${options.embeddingModel}`
+            reason: `embedding-store-empty:${tableContext.tableName}`
           }
       const queryVector = queryEmbeddingAttempt.vectorLiteral ?? null
       const queryEmbeddingReason =
@@ -441,12 +499,13 @@ export class AppService {
             weightedKeywords,
             keywordSignals,
             options,
-            tsConfig,
+            tableContext,
             normalizeAndAnalyzeMs,
             seedLookupMs,
             seedLookupAttempts,
             pipelineStartedAt,
-            queryEmbeddingReason
+            queryEmbeddingReason,
+            bm25Tokens
           )
         }
 
@@ -458,7 +517,8 @@ export class AppService {
           learning: {
             ...lexicalFallbackResult.learning,
             generatedSql:
-              `${lexicalFallbackResult.learning.generatedSql}\n-- fallback: lexical-like, reason: ${queryEmbeddingReason}, embeddingModel: ${options.embeddingModel}`,
+              `${lexicalFallbackResult.learning.generatedSql}
+-- fallback: lexical-like, reason: ${queryEmbeddingReason}, embeddingModel: ${options.embeddingModel}, tableName: ${tableContext.tableName}`,
             queryExplanation:
               `${lexicalFallbackResult.learning.queryExplanation} Fell back to lexical LIKE search because ${queryEmbeddingReason}.`,
             keywordSignals,
@@ -482,7 +542,7 @@ export class AppService {
           queryVector,
           candidatePool,
           options.bm25Enabled,
-          bm25QueryText,
+          bm25Tokens,
           semanticWeight,
           keywordWeight,
           effectiveMode === 'ivf',
@@ -500,7 +560,7 @@ export class AppService {
               queryVector,
               candidatePool,
               options.bm25Enabled,
-              bm25QueryText,
+              bm25Tokens,
               semanticWeight,
               keywordWeight,
               effectiveMode === 'ivf',
@@ -524,7 +584,8 @@ export class AppService {
           weightedKeywords,
           effectiveMode,
           semanticWeight,
-          keywordWeight
+          keywordWeight,
+          tableContext.tableName
         )
       )
 
@@ -544,12 +605,13 @@ export class AppService {
           weightedKeywords,
           keywordSignals,
           options,
-          tsConfig,
+          tableContext,
           normalizeAndAnalyzeMs,
           seedLookupMs,
           seedLookupAttempts,
           pipelineStartedAt,
-          weakAnnSignal ? 'ann-signal-weak' : 'ann-candidates-empty'
+          weakAnnSignal ? 'ann-signal-weak' : 'ann-candidates-empty',
+          bm25Tokens
         )
       }
 
@@ -557,8 +619,8 @@ export class AppService {
         ? this.parseExecutionPlan(planRows as Array<Record<string, unknown>>)
         : {}
       const queryExplanation = includeExplain
-        ? `${this.buildQueryExplanation(executionPlan)} Used model-generated query embedding. Keywords used: ${weightedKeywords.join(', ') || 'none'}.`
-        : `Execution plan omitted because SEARCH_INCLUDE_EXPLAIN is disabled. Used model-generated query embedding. Keywords used: ${weightedKeywords.join(', ') || 'none'}.`
+        ? `${this.buildQueryExplanation(executionPlan)} Used model-generated query embedding. Managed table: ${tableContext.tableName}. Language: ${tableContext.language}. Keywords used: ${weightedKeywords.join(', ') || 'none'}.`
+        : `Execution plan omitted because SEARCH_INCLUDE_EXPLAIN is disabled. Used model-generated query embedding. Managed table: ${tableContext.tableName}. Language: ${tableContext.language}. Keywords used: ${weightedKeywords.join(', ') || 'none'}.`
       const mappedItems = annPreviewItems
       const resultAssembleMs = Date.now() - resultAssembleStartedAt
 
@@ -567,7 +629,8 @@ export class AppService {
         total,
         learning: {
           generatedSql:
-            `${annSql.trim()}\n-- queryVectorSource: runtime-query-embedding, queryEmbedding: ${queryEmbeddingReason}, embeddingModel: ${options.embeddingModel}, requestedMode: ${options.mode}, effectiveMode: ${effectiveMode}, bm25: ${options.bm25Enabled}, hybridRatio: ${options.hybridRatio}, candidatePool: ${candidatePool}, tsConfig: ${tsConfig}, ranking: ${rankingStrategy}, rankTsQuery: ${weightedKeywords.join(' ') || 'none'}, bm25QueryText: ${bm25QueryText || 'none'}, bm25TsQueryMode: plainto_tsquery`,
+            `${annSql.trim()}
+-- queryVectorSource: runtime-query-embedding, queryEmbedding: ${queryEmbeddingReason}, embeddingModel: ${options.embeddingModel}, requestedMode: ${options.mode}, effectiveMode: ${effectiveMode}, bm25: ${options.bm25Enabled}, hybridRatio: ${options.hybridRatio}, candidatePool: ${candidatePool}, tsConfig: ${tsConfig}, ranking: ${rankingStrategy}, rankTsQuery: ${weightedKeywords.join(' ') || 'none'}, bm25QueryText: ${bm25QueryText || 'none'}, bm25Tokens: ${bm25Tokens.join(' ') || 'none'}, managedTable: ${tableContext.tableName}`,
           executionPlan,
           queryExplanation,
           keywordSignals,
@@ -592,12 +655,13 @@ export class AppService {
           weightedKeywords,
           keywordSignals,
           options,
-          tsConfig,
+          tableContext,
           normalizeAndAnalyzeMs,
           0,
           0,
           pipelineStartedAt,
-          `ann-query-failed:${this.describeError(error)}`
+          `ann-query-failed:${this.describeError(error)}`,
+          bm25Tokens
         )
       }
 
@@ -613,43 +677,60 @@ export class AppService {
     weightedKeywords: string[],
     keywordSignals: SearchKeywordSignal[],
     options: SearchHybridOptions,
-    tsConfig: string,
+    tableContext: ManagedSearchContext,
     normalizeAndAnalyzeMs: number,
     seedLookupMs: number,
     seedLookupAttempts: number,
     pipelineStartedAt: number,
-    fallbackReason: string
+    fallbackReason: string,
+    bm25Tokens: string[]
   ): Promise<SearchExecutionResult> {
+    const languageLiteral = this.sqlStringLiteral(tableContext.language)
+    const tableSql = this.quoteIdentifier(tableContext.tableName)
+    const idColumnSql = this.columnRef('d', tableContext.idColumn)
+    const titleColumnSql = this.columnRef('d', tableContext.titleColumn)
+    const contentColumnSql = this.columnRef('d', tableContext.contentColumn)
+    const textlenColumnSql = this.columnRef('d', tableContext.textlenColumn)
+    const snippetExpr = `LEFT(${contentColumnSql}, 240)`
+    const namespaceExpr = tableContext.supportsLegacyNamespace
+      ? 'd.namespace'
+      : `${this.sqlStringLiteral(tableContext.tableName)}`
+    const contributorsExpr = tableContext.supportsLegacyContributors
+      ? 'd.contributors'
+      : 'NULL::text'
+    const ftsExpr = this.buildSearchVectorExpression(tableContext, 'd')
+    const bm25ScoreExpr = this.buildBm25ScoreExpression(
+      tableContext,
+      idColumnSql,
+      textlenColumnSql,
+      1
+    )
     const fallbackSql = `
       WITH lexical_candidates AS (
         SELECT
-          d.id,
-          d.title,
-          LEFT(d.content, 240) AS snippet,
-          d.namespace,
-          d.contributors,
+          ${idColumnSql} AS id,
+          ${titleColumnSql} AS title,
+          ${snippetExpr} AS snippet,
+          ${namespaceExpr} AS namespace,
+          ${contributorsExpr} AS contributors,
+          ${bm25ScoreExpr} AS bm25_score,
           CASE
-            WHEN COALESCE(d.search_vector, ''::tsvector) @@ plainto_tsquery('${tsConfig}', $1)
-              THEN ts_rank_cd(COALESCE(d.search_vector, ''::tsvector), plainto_tsquery('${tsConfig}', $1), 32)
-            ELSE 0
-          END AS bm25_score,
-          CASE
-            WHEN to_tsvector('${tsConfig}', COALESCE(d.title, '')) @@ plainto_tsquery('${tsConfig}', $1)
+            WHEN to_tsvector(${languageLiteral}, COALESCE(${titleColumnSql}, '')) @@ plainto_tsquery(${languageLiteral}, $2)
               THEN true
             ELSE false
           END AS title_match,
           CASE
-            WHEN LOWER(COALESCE(d.title, '')) LIKE $2 THEN true
+            WHEN LOWER(COALESCE(${titleColumnSql}, '')) LIKE $3 THEN true
             ELSE false
           END AS like_title_match,
           CASE
-            WHEN LOWER(d.content) LIKE $3 THEN true
+            WHEN LOWER(${contentColumnSql}) LIKE $4 THEN true
             ELSE false
           END AS like_content_match
-        FROM namuwiki_documents d
-        WHERE COALESCE(d.search_vector, ''::tsvector) @@ plainto_tsquery('${tsConfig}', $1)
-           OR LOWER(COALESCE(d.title, '')) LIKE $2
-           OR LOWER(d.content) LIKE $3
+        FROM ${tableSql} d
+        WHERE ${ftsExpr} @@ plainto_tsquery(${languageLiteral}, $2)
+           OR LOWER(COALESCE(${titleColumnSql}, '')) LIKE $3
+           OR LOWER(${contentColumnSql}) LIKE $4
       )
       SELECT
         id,
@@ -668,16 +749,16 @@ export class AppService {
         like_title_match DESC,
         like_content_match DESC,
         id DESC
-      LIMIT $4 OFFSET $5
+      LIMIT $5 OFFSET $6
     `
 
     const fallbackCountSql = `
       WITH lexical_candidates AS (
-        SELECT d.id
-        FROM namuwiki_documents d
-        WHERE COALESCE(d.search_vector, ''::tsvector) @@ plainto_tsquery('${tsConfig}', $1)
-           OR LOWER(COALESCE(d.title, '')) LIKE $2
-           OR LOWER(d.content) LIKE $3
+        SELECT ${idColumnSql} AS id
+        FROM ${tableSql} d
+        WHERE ${ftsExpr} @@ plainto_tsquery(${languageLiteral}, $2)
+           OR LOWER(COALESCE(${titleColumnSql}, '')) LIKE $3
+           OR LOWER(${contentColumnSql}) LIKE $4
       )
       SELECT COUNT(*)::bigint AS total
       FROM lexical_candidates
@@ -691,7 +772,8 @@ export class AppService {
       const [rawRows, countRows, planRows] = await Promise.all([
         this.prismaService.$queryRawUnsafe(
           fallbackSql,
-          bm25QueryText,
+          bm25Tokens,
+          bm25QueryText || normalizedQuery,
           queryPattern,
           queryPattern,
           options.limit,
@@ -699,14 +781,16 @@ export class AppService {
         ),
         this.prismaService.$queryRawUnsafe(
           fallbackCountSql,
-          bm25QueryText,
+          bm25Tokens,
+          bm25QueryText || normalizedQuery,
           queryPattern,
           queryPattern
         ),
         includeExplain
           ? this.prismaService.$queryRawUnsafe(
               explainSql,
-              bm25QueryText,
+              bm25Tokens,
+              bm25QueryText || normalizedQuery,
               queryPattern,
               queryPattern,
               options.limit,
@@ -724,8 +808,8 @@ export class AppService {
         ? this.parseExecutionPlan(planRows as Array<Record<string, unknown>>)
         : {}
       const queryExplanation = includeExplain
-        ? `${this.buildQueryExplanation(executionPlan)} Fell back to BM25 search because ${fallbackReason}. Keywords used: ${weightedKeywords.join(', ') || 'none'}.`
-        : `Execution plan omitted because SEARCH_INCLUDE_EXPLAIN is disabled. Fell back to BM25 search because ${fallbackReason}. Keywords used: ${weightedKeywords.join(', ') || 'none'}.`
+        ? `${this.buildQueryExplanation(executionPlan)} Fell back to BM25 search because ${fallbackReason}. Managed table: ${tableContext.tableName}. Language: ${tableContext.language}. Keywords used: ${weightedKeywords.join(', ') || 'none'}.`
+        : `Execution plan omitted because SEARCH_INCLUDE_EXPLAIN is disabled. Fell back to BM25 search because ${fallbackReason}. Managed table: ${tableContext.tableName}. Language: ${tableContext.language}. Keywords used: ${weightedKeywords.join(', ') || 'none'}.`
 
       const items = rows.map((row) => {
         const bm25Score = this.toUnitInterval(
@@ -747,7 +831,7 @@ export class AppService {
           title: row.title ?? 'Untitled Document',
           snippet: row.snippet,
           score,
-          category: row.namespace ?? 'Unknown',
+          category: row.namespace ?? tableContext.tableName,
           distance: Number((1 - score).toFixed(4)),
           tags: this.toTags(row.contributors),
           matchRate: Number((score * 100).toFixed(1)),
@@ -765,7 +849,8 @@ export class AppService {
         total,
         learning: {
           generatedSql:
-            `${fallbackSql.trim()}\n-- fallbackStrategy: bm25-only, fallbackReason: ${fallbackReason}, embeddingModel: ${options.embeddingModel}, requestedMode: ${options.mode}, bm25: ${options.bm25Enabled}, hybridRatio: ${options.hybridRatio}, rankTsQuery: ${weightedKeywords.join(' ') || 'none'}, bm25QueryText: ${bm25QueryText || 'none'}`,
+            `${fallbackSql.trim()}
+-- fallbackStrategy: bm25-only, fallbackReason: ${fallbackReason}, embeddingModel: ${options.embeddingModel}, requestedMode: ${options.mode}, bm25: ${options.bm25Enabled}, hybridRatio: ${options.hybridRatio}, rankTsQuery: ${weightedKeywords.join(' ') || 'none'}, bm25QueryText: ${bm25QueryText || 'none'}, bm25Tokens: ${bm25Tokens.join(' ') || 'none'}, managedTable: ${tableContext.tableName}`,
           executionPlan,
           queryExplanation,
           keywordSignals,
@@ -788,7 +873,8 @@ export class AppService {
         learning: {
           ...unavailableResult.learning,
           generatedSql:
-            `${unavailableResult.learning.generatedSql}\n-- fallbackStrategy: bm25-only, fallbackReason: ${fallbackReason}`,
+            `${unavailableResult.learning.generatedSql}
+-- fallbackStrategy: bm25-only, fallbackReason: ${fallbackReason}, managedTable: ${tableContext.tableName}`,
           keywordSignals,
           pipelineTimings: {
             normalizeAndAnalyzeMs,
@@ -804,23 +890,16 @@ export class AppService {
     }
   }
 
-  private async hasEmbeddings(embeddingModel: EmbeddingModel): Promise<boolean> {
-    const availabilitySql =
-      embeddingModel === 'qwen3'
-        ? `
-          SELECT EXISTS(
-            SELECT 1
-            FROM namuwiki_document_embeddings_qwen
-            WHERE embedding IS NOT NULL
-          ) AS available
-        `
-        : `
-          SELECT EXISTS(
-            SELECT 1
-            FROM namuwiki_documents
-            WHERE embedding IS NOT NULL
-          ) AS available
-        `
+  private async hasEmbeddingsForContext(
+    tableContext: ManagedSearchContext
+  ): Promise<boolean> {
+    const availabilitySql = `
+      SELECT EXISTS(
+        SELECT 1
+        FROM ${this.buildHybridSourceJoin(tableContext)}
+        WHERE ${this.buildEmbeddingExpression(tableContext)} IS NOT NULL
+      ) AS available
+    `
 
     try {
       const rows = (await this.prismaService.$queryRawUnsafe(availabilitySql)) as Array<{
@@ -830,6 +909,201 @@ export class AppService {
     } catch {
       return false
     }
+  }
+
+  private async resolveManagedSearchContext(
+    tableName?: string
+  ): Promise<ManagedSearchContext> {
+    const normalizedTableName = tableName?.trim()
+
+    if (!normalizedTableName || normalizedTableName === 'namuwiki_documents') {
+      return {
+        tableName: 'namuwiki_documents',
+        language: 'korean',
+        tableSuffix: 'korean',
+        idColumn: 'id',
+        docHashColumn: 'doc_hash',
+        titleColumn: 'title',
+        contentColumn: 'content',
+        textlenColumn: 'textlen',
+        ftsColumn: 'fts',
+        embeddingColumn: 'embedding_qwen',
+        embeddingHnswColumn: 'embedding_hnsw',
+        k1: 1.2,
+        b: 0.75,
+        supportsLegacyNamespace: true,
+        supportsLegacyContributors: true
+      }
+    }
+
+    const rows = await this.prismaService.$queryRawUnsafe(
+      `
+        SELECT
+          mt.table_name,
+          mt.language,
+          mt.id_column,
+          mt.doc_hash_column,
+          mt.title_column,
+          mt.content_column,
+          mt.textlen_column,
+          mt.fts_column,
+          mt.embedding_column,
+          mt.embedding_hnsw_column,
+          COALESCE(sl.table_suffix, mt.language) AS table_suffix,
+          COALESCE(settings.k1, 1.2) AS k1,
+          COALESCE(settings.b, 0.75) AS b
+        FROM search_managed_tables mt
+        LEFT JOIN search_supported_languages sl
+          ON sl.language = mt.language
+        LEFT JOIN search_bm25_language_settings settings
+          ON settings.language = mt.language
+        WHERE mt.table_name = $1
+          AND mt.is_active = TRUE
+        LIMIT 1
+      `,
+      normalizedTableName
+    ) as Array<{
+      table_name: string
+      language: string
+      id_column: string
+      doc_hash_column: string | null
+      title_column: string
+      content_column: string
+      textlen_column: string
+      fts_column: string
+      embedding_column: string
+      embedding_hnsw_column: string
+      table_suffix: string
+      k1: number
+      b: number
+    }>
+
+    const row = rows[0]
+
+    if (!row) {
+      throw new Error(`Managed table not found: ${normalizedTableName}`)
+    }
+
+    return {
+      tableName: row.table_name,
+      language: row.language,
+      tableSuffix: row.table_suffix,
+      idColumn: row.id_column,
+      docHashColumn: row.doc_hash_column,
+      titleColumn: row.title_column,
+      contentColumn: row.content_column,
+      textlenColumn: row.textlen_column,
+      ftsColumn: row.fts_column,
+      embeddingColumn: row.embedding_column,
+      embeddingHnswColumn: row.embedding_hnsw_column,
+      k1: Number(row.k1),
+      b: Number(row.b),
+      supportsLegacyNamespace: false,
+      supportsLegacyContributors: false
+    }
+  }
+
+  private async tokenizeForSearch(
+    language: string,
+    query: string,
+    fallbackTokens: string[]
+  ): Promise<string[]> {
+    const normalizedTokens = fallbackTokens
+      .map((token) => token.trim())
+      .filter((token) => token.length > 0)
+      .filter((token, index, source) => source.indexOf(token) === index)
+
+    if (normalizedTokens.length > 0) {
+      return normalizedTokens
+    }
+
+    return this.extractQueryTerms(query.toLowerCase())
+  }
+
+  private buildHybridSourceJoin(tableContext: ManagedSearchContext): string {
+    const tableSql = this.quoteIdentifier(tableContext.tableName)
+
+    if (
+      tableContext.tableName === 'namuwiki_documents' &&
+      tableContext.docHashColumn === 'doc_hash'
+    ) {
+      return `${tableSql} d LEFT JOIN namuwiki_document_embeddings_qwen legacy ON legacy.doc_hash = d.${this.quoteIdentifier(tableContext.docHashColumn)}`
+    }
+
+    return `${tableSql} d`
+  }
+
+  private buildEmbeddingExpression(tableContext: ManagedSearchContext): string {
+    const managedEmbeddingExpr = this.columnRef('d', tableContext.embeddingHnswColumn)
+
+    if (
+      tableContext.tableName === 'namuwiki_documents' &&
+      tableContext.docHashColumn === 'doc_hash'
+    ) {
+      return `COALESCE(${managedEmbeddingExpr}, legacy.embedding)`
+    }
+
+    return managedEmbeddingExpr
+  }
+
+  private buildSearchVectorExpression(
+    tableContext: ManagedSearchContext,
+    alias: string
+  ): string {
+    const ftsColumnSql = this.columnRef(alias, tableContext.ftsColumn)
+    const titleColumnSql = this.columnRef(alias, tableContext.titleColumn)
+    const contentColumnSql = this.columnRef(alias, tableContext.contentColumn)
+    const generatedVector = `to_tsvector(${this.sqlStringLiteral(tableContext.language)}, concat_ws(' ', COALESCE(${titleColumnSql}, ''), COALESCE(${contentColumnSql}, '')))`
+
+    if (tableContext.tableName === 'namuwiki_documents') {
+      return `COALESCE(${ftsColumnSql}, ${alias}.search_vector, ${generatedVector})`
+    }
+
+    return `COALESCE(${ftsColumnSql}, ${generatedVector})`
+  }
+
+  private buildBm25ScoreExpression(
+    tableContext: ManagedSearchContext,
+    docIdExpression: string,
+    docLengthExpression: string,
+    tokenParamIndex: number
+  ): string {
+    const tokenTable = this.quoteIdentifier(`bm25tokens_${tableContext.tableSuffix}`)
+    const idfTable = this.quoteIdentifier(`bm25idf_${tableContext.tableSuffix}`)
+    const lengthTable = this.quoteIdentifier(`bm25length_${tableContext.tableSuffix}`)
+    const tableNameLiteral = this.sqlStringLiteral(tableContext.tableName)
+    const k1 = Number(tableContext.k1.toFixed(6))
+    const b = Number(tableContext.b.toFixed(6))
+    const numeratorFactor = Number((k1 + 1).toFixed(6))
+
+    return `COALESCE((
+      WITH stats AS (
+        SELECT
+          COALESCE(SUM(recordcount), 0)::double precision AS doc_count,
+          COALESCE(MAX(CASE WHEN tablename = ${tableNameLiteral} THEN avglen END), 0)::double precision AS avglen
+        FROM ${lengthTable}
+      )
+      SELECT SUM(
+        LN(1 + ((stats.doc_count - idf.tfdoc + 0.5) / (idf.tfdoc + 0.5))) *
+        (
+          (tok.tf * ${numeratorFactor}) /
+          (
+            tok.tf +
+            ${k1} * (
+              1 - ${b} +
+              ${b} * COALESCE(${docLengthExpression}, 0)::double precision /
+                NULLIF(stats.avglen, 0)
+            )
+          )
+        )
+      )
+      FROM ${tokenTable} tok
+      JOIN ${idfTable} idf
+        ON idf.token = tok.token
+      CROSS JOIN stats
+      WHERE tok.id = ${docIdExpression}
+        AND tok.token = ANY($${tokenParamIndex}::text[])
+    ), 0)`
   }
 
   private describeError(error: unknown): string {
@@ -978,7 +1252,8 @@ export class AppService {
     weightedKeywords: string[],
     effectiveMode: 'hnsw' | 'ivf',
     semanticWeight: number,
-    keywordWeight: number
+    keywordWeight: number,
+    fallbackCategory: string
   ): SearchResult {
     const vectorScore = this.toUnitInterval(
       effectiveMode === 'ivf'
@@ -997,7 +1272,7 @@ export class AppService {
       title: row.title ?? 'Untitled Document',
       snippet: row.snippet,
       score,
-      category: row.namespace ?? 'Unknown',
+      category: row.namespace ?? fallbackCategory,
       distance: Number((1 - score).toFixed(4)),
       tags: this.toTags(row.contributors),
       matchRate: Number((score * 100).toFixed(1)),
@@ -1100,6 +1375,22 @@ export class AppService {
     return AppService.GENERIC_INTENT_KEYWORDS.includes(
       keyword as (typeof AppService.GENERIC_INTENT_KEYWORDS)[number]
     )
+  }
+
+  private quoteIdentifier(identifier: string): string {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(identifier)) {
+      throw new Error(`Invalid SQL identifier: ${identifier}`)
+    }
+
+    return `"${identifier}"`
+  }
+
+  private columnRef(alias: string, column: string): string {
+    return `${alias}.${this.quoteIdentifier(column)}`
+  }
+
+  private sqlStringLiteral(value: string): string {
+    return `'${value.replace(/'/g, "''")}'`
   }
 
   private toTags(contributors: string | null): string[] {
