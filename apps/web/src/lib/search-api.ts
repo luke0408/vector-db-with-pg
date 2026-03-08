@@ -121,6 +121,23 @@ export interface Bm25LanguageStatus {
   managedTablesUsingLanguage: string[]
 }
 
+export interface Bm25SettingsUpdateRequest {
+  k1?: number
+  b?: number
+}
+
+export interface Bm25IndexingEvent {
+  event: 'started' | 'chunk' | 'completed' | 'cancelled' | 'error'
+  language: string
+  chunkSize: number
+  claimedTasks?: number
+  affectedDocs?: number
+  processedTasks?: number
+  remainingTasks?: number
+  elapsedMs?: number
+  message?: string
+}
+
 export interface RegisterExistingTableRequest {
   tableName: string
   language?: string
@@ -132,6 +149,12 @@ export interface RegisterExistingTableResult {
   table: ManagedTableSummary
   initializedData: boolean
   bm25LanguageStatus: Bm25LanguageStatus
+}
+
+export interface Bm25IndexingStreamOptions {
+  chunkSize: number
+  onEvent: (event: Bm25IndexingEvent) => void
+  signal?: AbortSignal
 }
 
 export interface ApiEnvelope<T> {
@@ -189,6 +212,85 @@ export async function registerExistingTable(
       body: JSON.stringify(payload)
     }
   )
+}
+
+export async function updateBm25Settings(
+  language: string,
+  payload: Bm25SettingsUpdateRequest
+): Promise<ApiEnvelope<Bm25LanguageStatus>> {
+  return requestJson<ApiEnvelope<Bm25LanguageStatus>>(
+    `/api/admin/bm25/${encodeURIComponent(language)}/settings`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify(payload)
+    }
+  )
+}
+
+export async function runBm25IndexingStream(
+  language: string,
+  options: Bm25IndexingStreamOptions
+): Promise<void> {
+  const response = await fetch(
+    `${SERVER_BASE_URL}/api/admin/bm25/${encodeURIComponent(language)}/run?chunkSize=${encodeURIComponent(String(options.chunkSize))}`,
+    {
+      method: 'GET',
+      signal: options.signal
+    }
+  )
+
+  if (!response.ok) {
+    throw new Error(`Indexing request failed with status ${response.status}`)
+  }
+
+  if (!response.body) {
+    throw new Error('Indexing response did not include a stream body')
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let pendingEventName = 'message'
+
+  while (true) {
+    const chunk = await reader.read()
+
+    if (chunk.done) {
+      break
+    }
+
+    buffer += decoder.decode(chunk.value, { stream: true })
+
+    while (true) {
+      const boundaryIndex = buffer.indexOf('\n\n')
+
+      if (boundaryIndex === -1) {
+        break
+      }
+
+      const rawEvent = buffer.slice(0, boundaryIndex)
+      buffer = buffer.slice(boundaryIndex + 2)
+
+      let data = ''
+      for (const line of rawEvent.split('\n')) {
+        if (line.startsWith('event:')) {
+          pendingEventName = line.slice(6).trim()
+        } else if (line.startsWith('data:')) {
+          data += line.slice(5).trim()
+        }
+      }
+
+      if (!data) {
+        continue
+      }
+
+      const parsed = JSON.parse(data) as Bm25IndexingEvent
+      options.onEvent({
+        ...parsed,
+        event: (parsed.event ?? pendingEventName) as Bm25IndexingEvent['event']
+      })
+    }
+  }
 }
 
 async function requestJson<T>(

@@ -5,7 +5,9 @@ import {
   listAdminLanguages,
   listManagedTables,
   registerExistingTable,
-  searchDocuments
+  runBm25IndexingStream,
+  searchDocuments,
+  updateBm25Settings,
 } from './lib/search-api'
 
 vi.mock('./lib/search-api', async () => {
@@ -17,7 +19,9 @@ vi.mock('./lib/search-api', async () => {
     listAdminLanguages: vi.fn(),
     listManagedTables: vi.fn(),
     getBm25LanguageStatus: vi.fn(),
-    registerExistingTable: vi.fn()
+    registerExistingTable: vi.fn(),
+    updateBm25Settings: vi.fn(),
+    runBm25IndexingStream: vi.fn()
   }
 })
 
@@ -26,9 +30,28 @@ const mockedListAdminLanguages = vi.mocked(listAdminLanguages)
 const mockedListManagedTables = vi.mocked(listManagedTables)
 const mockedGetBm25LanguageStatus = vi.mocked(getBm25LanguageStatus)
 const mockedRegisterExistingTable = vi.mocked(registerExistingTable)
+const mockedUpdateBm25Settings = vi.mocked(updateBm25Settings)
+const mockedRunBm25IndexingStream = vi.mocked(runBm25IndexingStream)
 
 describe('App', () => {
   beforeEach(() => {
+    const storage = new Map<string, string>()
+    Object.defineProperty(window, 'localStorage', {
+      configurable: true,
+      value: {
+        getItem: vi.fn((key: string) => storage.get(key) ?? null),
+        setItem: vi.fn((key: string, value: string) => {
+          storage.set(key, value)
+        }),
+        removeItem: vi.fn((key: string) => {
+          storage.delete(key)
+        }),
+        clear: vi.fn(() => {
+          storage.clear()
+        })
+      }
+    })
+
     mockedSearchDocuments.mockResolvedValue({
       success: true,
       data: [
@@ -172,6 +195,51 @@ describe('App', () => {
         }
       ]
     })
+
+    mockedUpdateBm25Settings.mockResolvedValue({
+      success: true,
+      data: [
+        {
+          language: 'korean',
+          tableSuffix: 'korean',
+          k1: 1.5,
+          b: 0.6,
+          lastIndexedAt: null,
+          queue: {
+            pending: 0,
+            inProgress: 0,
+            completed: 0
+          },
+          lengths: {
+            managedTables: 1,
+            totalDocuments: 59008,
+            totalLength: 123456,
+            averageLength: 2.1
+          },
+          tokens: {
+            uniqueTokens: 1234
+          },
+          managedTablesUsingLanguage: ['namuwiki_documents']
+        }
+      ]
+    })
+
+    mockedRunBm25IndexingStream.mockImplementation(async (_language, options) => {
+      options.onEvent({
+        event: 'started',
+        language: 'korean',
+        chunkSize: options.chunkSize,
+        processedTasks: 0,
+        remainingTasks: 2
+      })
+      options.onEvent({
+        event: 'completed',
+        language: 'korean',
+        chunkSize: options.chunkSize,
+        processedTasks: 2,
+        remainingTasks: 0
+      })
+    })
   })
 
   afterEach(() => {
@@ -305,5 +373,57 @@ describe('App', () => {
         })
       )
     })
+  })
+
+  it('updates bm25 settings from the admin panel', async () => {
+    render(<App />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Admin' }))
+
+    await waitFor(() => {
+      expect(mockedGetBm25LanguageStatus).toHaveBeenCalledWith('korean')
+    })
+
+    const k1Input = screen.getByLabelText('k1')
+    const bInput = screen.getByLabelText('b')
+
+    fireEvent.change(k1Input, { target: { value: '1.5' } })
+    fireEvent.change(bInput, { target: { value: '0.6' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save BM25 Settings' }))
+
+    await waitFor(() => {
+      expect(mockedUpdateBm25Settings).toHaveBeenCalledWith('korean', {
+        k1: 1.5,
+        b: 0.6
+      })
+    })
+  })
+
+  it('runs bm25 indexing and stores chunk size per language', async () => {
+    render(<App />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Admin' }))
+
+    await waitFor(() => {
+      expect(mockedGetBm25LanguageStatus).toHaveBeenCalledWith('korean')
+    })
+
+    const chunkSizeInput = screen.getByLabelText('Chunk size')
+    fireEvent.change(chunkSizeInput, { target: { value: '25' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Run Indexing' }))
+
+    await waitFor(() => {
+      expect(mockedRunBm25IndexingStream).toHaveBeenCalledWith(
+        'korean',
+        expect.objectContaining({
+          chunkSize: 25,
+          onEvent: expect.any(Function),
+          signal: expect.any(AbortSignal)
+        })
+      )
+    })
+
+    expect(window.localStorage.getItem('bm25-chunk-size:korean')).toBe('25')
+    expect(screen.getByText(/processed=2/i)).toBeInTheDocument()
   })
 })

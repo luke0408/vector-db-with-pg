@@ -5,7 +5,9 @@ import {
   type KeyboardEvent
 } from 'react'
 import {
+  Bm25IndexingEvent,
   Bm25LanguageStatus,
+  Bm25SettingsUpdateRequest,
   ManagedLanguageSummary,
   ManagedTableSummary,
   SearchLearningData,
@@ -15,13 +17,49 @@ import {
   listAdminLanguages,
   listManagedTables,
   registerExistingTable,
-  searchDocuments
+  runBm25IndexingStream,
+  searchDocuments,
+  updateBm25Settings,
 } from './lib/search-api'
 import { formatSnippet } from './lib/snippet-format'
 
 type SearchMode = 'none' | 'hnsw' | 'ivf'
 type EmbeddingModel = 'base' | 'qwen3'
 type ViewMode = 'search' | 'admin'
+type IndexingRunState = {
+  isRunning: boolean
+  events: Bm25IndexingEvent[]
+}
+
+const BM25_CHUNK_SIZE_STORAGE_PREFIX = 'bm25-chunk-size:'
+
+function readChunkSizePreference(language: string): string {
+  if (
+    typeof window === 'undefined' ||
+    typeof window.localStorage?.getItem !== 'function'
+  ) {
+    return '100'
+  }
+
+  return (
+    window.localStorage.getItem(`${BM25_CHUNK_SIZE_STORAGE_PREFIX}${language}`) ??
+    '100'
+  )
+}
+
+function writeChunkSizePreference(language: string, chunkSize: number): void {
+  if (
+    typeof window === 'undefined' ||
+    typeof window.localStorage?.setItem !== 'function'
+  ) {
+    return
+  }
+
+  window.localStorage.setItem(
+    `${BM25_CHUNK_SIZE_STORAGE_PREFIX}${language}`,
+    String(chunkSize)
+  )
+}
 
 const emptyLearning: SearchLearningData = {
   generatedSql: '-- run search to generate SQL',
@@ -57,6 +95,16 @@ export function App() {
   const [adminError, setAdminError] = useState<string | null>(null)
   const [adminLoading, setAdminLoading] = useState(false)
   const [registering, setRegistering] = useState(false)
+  const [bm25SettingsDraft, setBm25SettingsDraft] =
+    useState<Bm25SettingsUpdateRequest>({})
+  const [savingBm25Settings, setSavingBm25Settings] = useState(false)
+  const [chunkSizeInput, setChunkSizeInput] = useState('100')
+  const [indexingState, setIndexingState] = useState<IndexingRunState>({
+    isRunning: false,
+    events: []
+  })
+  const [indexingAbortController, setIndexingAbortController] =
+    useState<AbortController | null>(null)
 
   const totalMatches = meta?.total ?? results.length
   const searchTime = meta?.tookMs ?? 0
@@ -96,6 +144,30 @@ export function App() {
 
     void loadSelectedLanguageStatus(selectedLanguage)
   }, [viewMode, selectedLanguage])
+
+  useEffect(() => {
+    if (!selectedLanguageStatus) {
+      return
+    }
+
+    setBm25SettingsDraft({
+      k1: selectedLanguageStatus.k1,
+      b: selectedLanguageStatus.b
+    })
+  }, [selectedLanguageStatus])
+
+  useEffect(() => {
+    if (!selectedLanguage) {
+      return
+    }
+
+    setChunkSizeInput(readChunkSizePreference(selectedLanguage))
+    setIndexingState({
+      isRunning: false,
+      events: []
+    })
+    setIndexingAbortController(null)
+  }, [selectedLanguage])
 
   const handleSearch = async (nextOffset: number) => {
     setIsLoading(true)
@@ -212,6 +284,115 @@ export function App() {
 
     await loadAdminOverview()
     setRegistering(false)
+  }
+
+  const handleSaveBm25Settings = async () => {
+    if (!selectedLanguage) {
+      return
+    }
+
+    setSavingBm25Settings(true)
+    setAdminError(null)
+
+    const response = await updateBm25Settings(selectedLanguage, bm25SettingsDraft)
+
+    if (!response.success) {
+      setAdminError(response.error ?? 'Failed to update BM25 settings')
+      setSavingBm25Settings(false)
+      return
+    }
+
+    const nextStatus = response.data[0] ?? null
+    setSelectedLanguageStatus(nextStatus)
+    await loadAdminOverview()
+    setSavingBm25Settings(false)
+  }
+
+  const handleRunBm25Indexing = async () => {
+    if (!selectedLanguage) {
+      return
+    }
+
+    const parsedChunkSize = Number(chunkSizeInput)
+
+    if (!Number.isInteger(parsedChunkSize) || parsedChunkSize <= 0) {
+      setAdminError('Chunk size must be a positive integer.')
+      return
+    }
+
+    writeChunkSizePreference(selectedLanguage, parsedChunkSize)
+
+    const controller = new AbortController()
+    setIndexingAbortController(controller)
+    setIndexingState({
+      isRunning: true,
+      events: []
+    })
+    setAdminError(null)
+
+    try {
+      await runBm25IndexingStream(selectedLanguage, {
+        chunkSize: parsedChunkSize,
+        signal: controller.signal,
+        onEvent: (event) => {
+          setIndexingState((current) => ({
+            isRunning:
+              event.event !== 'completed' &&
+              event.event !== 'cancelled' &&
+              event.event !== 'error',
+            events: [...current.events, event]
+          }))
+        }
+      })
+    } catch (error) {
+      if (
+        !(error instanceof DOMException && error.name === 'AbortError')
+      ) {
+        setAdminError(
+          error instanceof Error ? error.message : 'Failed to run BM25 indexing'
+        )
+        setIndexingState((current) => ({
+          isRunning: false,
+          events: [
+            ...current.events,
+            {
+              event: 'error',
+              language: selectedLanguage,
+              chunkSize: parsedChunkSize,
+              message:
+                error instanceof Error
+                  ? error.message
+                  : 'Failed to run BM25 indexing'
+            }
+          ]
+        }))
+      }
+    } finally {
+      setIndexingAbortController(null)
+      setIndexingState((current) => ({
+        ...current,
+        isRunning: false
+      }))
+      await loadAdminOverview()
+      await loadSelectedLanguageStatus(selectedLanguage)
+    }
+  }
+
+  const handleCancelBm25Indexing = () => {
+    indexingAbortController?.abort()
+    setIndexingAbortController(null)
+    setIndexingState((current) => ({
+      isRunning: false,
+      events: [
+        ...current.events,
+        {
+          event: 'cancelled',
+          language: selectedLanguage || 'unknown',
+          chunkSize: Number(chunkSizeInput) || 100,
+          message: 'Cancelled from admin UI.'
+        }
+      ]
+    }))
   }
 
   const handleQueryKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
@@ -548,7 +729,7 @@ export function App() {
           <section className="admin-grid">
             <article className="panel admin-panel admin-actions-panel">
               <header className="panel-title-row">
-                <strong>Phase 1 Managed Search Admin</strong>
+                <strong>Managed Search Admin</strong>
                 <div className="panel-actions">
                   <button type="button" onClick={() => void loadAdminOverview()}>
                     Refresh
@@ -645,7 +826,7 @@ export function App() {
               <div className="right-column">
                 <article className="panel admin-panel">
                   <header className="panel-title-row">
-                    <strong>BM25 Status</strong>
+                    <strong>BM25 Control Tower</strong>
                     <span className="panel-caption">{selectedLanguage || 'select a language'}</span>
                   </header>
 
@@ -678,6 +859,111 @@ export function App() {
 
                   {selectedLanguageStatus ? (
                     <div className="admin-status-detail">
+                      <div className="admin-card">
+                        <div className="admin-card-head">
+                          <strong>BM25 Settings</strong>
+                          <span className="pill">editable</span>
+                        </div>
+                        <div className="admin-form-grid">
+                          <label className="admin-field">
+                            <span>k1</span>
+                            <input
+                              type="number"
+                              min={0.1}
+                              step={0.05}
+                              value={bm25SettingsDraft.k1 ?? ''}
+                              onChange={(event) =>
+                                setBm25SettingsDraft((current) => ({
+                                  ...current,
+                                  k1: Number(event.target.value)
+                                }))
+                              }
+                            />
+                          </label>
+                          <label className="admin-field">
+                            <span>b</span>
+                            <input
+                              type="number"
+                              min={0}
+                              max={1}
+                              step={0.05}
+                              value={bm25SettingsDraft.b ?? ''}
+                              onChange={(event) =>
+                                setBm25SettingsDraft((current) => ({
+                                  ...current,
+                                  b: Number(event.target.value)
+                                }))
+                              }
+                            />
+                          </label>
+                        </div>
+                        <div className="admin-actions-row">
+                          <button
+                            className="primary-button"
+                            type="button"
+                            onClick={() => void handleSaveBm25Settings()}
+                            disabled={savingBm25Settings || indexingState.isRunning}
+                          >
+                            {savingBm25Settings ? 'Saving...' : 'Save BM25 Settings'}
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="admin-card">
+                        <div className="admin-card-head">
+                          <strong>Indexing Runner</strong>
+                          <span className="pill">{indexingState.isRunning ? 'running' : 'idle'}</span>
+                        </div>
+                        <div className="admin-form-grid">
+                          <label className="admin-field">
+                            <span>Chunk size</span>
+                            <input
+                              type="number"
+                              min={1}
+                              step={1}
+                              value={chunkSizeInput}
+                              onChange={(event) => setChunkSizeInput(event.target.value)}
+                            />
+                          </label>
+                        </div>
+                        <div className="admin-actions-row">
+                          <button
+                            className="primary-button"
+                            type="button"
+                            onClick={() => void handleRunBm25Indexing()}
+                            disabled={indexingState.isRunning || adminLoading}
+                          >
+                            {indexingState.isRunning ? 'Indexing...' : 'Run Indexing'}
+                          </button>
+                          <button
+                            className="ghost-button"
+                            type="button"
+                            onClick={handleCancelBm25Indexing}
+                            disabled={!indexingState.isRunning}
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                        <div className="indexing-log">
+                          {indexingState.events.length > 0 ? (
+                            indexingState.events.map((event, index) => (
+                              <div className="indexing-log-item" key={`${event.event}-${index}`}>
+                                <strong>{event.event}</strong>
+                                <span>
+                                  processed={event.processedTasks ?? 0} • remaining=
+                                  {event.remainingTasks ?? 0}
+                                </span>
+                                {event.message ? <small>{event.message}</small> : null}
+                              </div>
+                            ))
+                          ) : (
+                            <p className="empty-state">
+                              Run indexing to stream chunk progress for this language.
+                            </p>
+                          )}
+                        </div>
+                      </div>
+
                       <div className="info-table">
                         <div>
                           <span>Language</span>
