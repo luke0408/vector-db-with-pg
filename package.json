@@ -10,6 +10,7 @@
     "dev:server": "npm --workspace @vector-search/server run start:dev",
     "benchmark:ann:setup": "bash infra/benchmark/ann-benchmarks/setup.sh",
     "benchmark:ann:run": "bash infra/benchmark/ann-benchmarks/run.sh",
+    "benchmark:search:latency": "node infra/benchmark/search-latency/run.mjs",
     "benchmark:ops:report": "bash infra/benchmark/ops-tuning/collect-report.sh",
     "build": "npm run build:web && npm run build:server",
     "build:web": "npm --workspace @vector-search/web run build",

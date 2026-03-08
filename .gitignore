@@ -17,3 +17,4 @@ tmp/
 data/*.parquet
 data/
 infra/db/data/
+.artifacts/search-latency/
